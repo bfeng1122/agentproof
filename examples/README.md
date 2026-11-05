@@ -73,7 +73,7 @@ $PY -m verieffect.cli claim db_row_matches --agent demo \
 ## 4. exit_code — "the build passes" (idempotent commands only)
 
 Gated OFF by default; opt in with `allow_shell`. Use only read-only/idempotent
-commands — the probe RE-RUNS the command at verify time.
+commands — Verieffect RE-RUNS the command itself when the claim is filed.
 
 ```bash
 $PY -m verieffect.cli claim exit_code --agent demo \
@@ -107,6 +107,10 @@ if $PY -m verieffect.cli claim file_exists --agent cron \
      --target /var/backups/db.dump --expect '{"min_bytes": 1048576}'; then
   echo "backup verified"
 else
-  echo "backup MISSING or too small" >&2   # exit 1 = FAIL/UNVERIFIABLE
+  echo "backup MISSING, too small, or unverifiable" >&2   # 1 = FAIL, 3 = UNVERIFIABLE
 fi
 ```
+
+To tell FAIL from UNVERIFIABLE (e.g. alert on FAIL, retry on UNVERIFIABLE),
+branch on `$?`: `0` PASS, `1` FAIL, `3` UNVERIFIABLE, `2` usage error / claim
+aborted, `4` internal error.

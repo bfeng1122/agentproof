@@ -84,12 +84,75 @@ Chain (audit):
    the final `prev` (chain head) and receipt count against externally anchored
    values to detect those (`checkpoint` prints the anchor).
 
+## Expect schemas (strict)
+
+`expect` MUST be a JSON object. Each probe accepts only the keys below. A
+non-object `expect`, an **unknown key** (e.g. the typo `min_byte`), or a wrongly
+typed value makes the probe return `UNVERIFIABLE`, with `observed.error` (and
+`observed.unknown_keys`) naming the offending key(s). An unrecognized key is an
+assertion that would otherwise silently go unchecked. (The CLI records a
+non-object `--expect` as `{"_non_object_expect": <value>}` so the receipt's
+`expect` field stays an object.)
+
+| Probe | Allowed keys |
+|---|---|
+| `file_exists` | `min_bytes`, `max_bytes`, `modified_within_s` (numbers); `sha256`, `contains`, `modified_after`, `modified_before` (strings) |
+| `http_ok` | `status`, `max_body_bytes` (ints); `body_contains`, `body_sha256`, `method` (strings); `allow_unsafe_method`, `follow_redirects`, `final_url_matches_target` (bools); `timeout_s` |
+| `db_row_matches` sqlite | `query` (string, required), `rows` (array), `row_count` (int), `timeout_s` |
+| `db_row_matches` jsonl | `match` (object, required), `where` (object), `occurrence` (`last`/`first`/`any`/`count`) |
+| `db_row_matches` json | `fields` (object, required) |
+| `exit_code` | `allow_shell` (bool), `exit_code`, `max_output_bytes` (ints), `stdout_contains`, `stdout_sha256`, `workdir` (strings), `timeout_s` |
+
+`timeout_s` everywhere: a finite number `> 0` and `≤ 86400`. Anything else is
+`UNVERIFIABLE`, never "wait forever."
+
+**A probe that asserts nothing proves nothing.** `db_row_matches` requires at least
+one result assertion. For sqlite that is `rows` and/or `row_count`. For jsonl it is a
+non-empty `match`, and for json a non-empty `fields`. Without one, the verdict is
+`UNVERIFIABLE` ("no assertion in expect"). `file_exists` with `{}` is the one
+deliberate exception: it asserts that a **regular file** exists, which is its
+documented purpose.
+
+## Exit codes
+
+| Tool | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| `verieffect claim` | PASS | FAIL | usage error / claim aborted, no receipt written | UNVERIFIABLE (receipt written) | internal error |
+| `verify_receipt.py` | authentic (and, with `--require-verdict`, all verdicts match) | invalid/tampered/malformed, `--agent` mismatch, empty chain, or a non-UNVERIFIABLE verdict mismatch | usage error | authentic, but `--require-verdict` failed only because of UNVERIFIABLE verdicts | internal error |
+
+`verieffect verify`/`audit`/`checkpoint`/`repair` use `0` = OK, `1` = invalid/broken,
+`2` = could not run (missing key, unparsable input, no receipts).
+
 ## Verdict semantics
 
 - A probe NEVER returns `PASS` when ground truth was unreachable. Missing optional
-  dependencies (e.g. `requests`) and network/spawn errors yield `UNVERIFIABLE`.
+  dependencies (e.g. `requests`), DNS failure, connection refused, timeouts,
+  spawn errors and a missing binary yield `UNVERIFIABLE`. A missing binary means
+  POSIX shell exit 126/127, or on Windows cmd exit 9009 or its "not recognized"
+  message. `FAIL` is reserved for a genuine mismatch between observed state and the
+  expectation.
 - A missing target file is `FAIL` for `file_exists`/`db_row_matches` (the claimed
-  record does not exist), not `UNVERIFIABLE`.
+  record does not exist), not `UNVERIFIABLE`. So is a target that exists but is
+  not a regular file: `file_exists` follows symlinks and requires `S_ISREG`, and a
+  directory FAILs with `observed.is_dir: true`.
+- Numeric matching is exact: int vs int compares exactly, and int vs float uses
+  exact mathematical comparison with no `float()` rounding, so `9007199254740993`
+  never matches `9007199254740992`. Lists and objects compare element-wise with the
+  same rules.
+- `null` in `match`/`where`/`fields` only matches an explicit JSON `null`. An
+  **absent** field is recorded as `"<missing>"` and never equals `null`.
+- jsonl `occurrence: "any"` PASSes only if a **single** row satisfies every
+  `match` field. Fields satisfied piecemeal across different rows do not count.
+  `occurrence: "count"` requires `match` to be exactly `{"_count": N}`.
+- sqlite `timeout_s` (default 10 s) is a real wall-clock deadline, enforced by
+  a progress handler plus a timer calling `interrupt()`. A runaway query
+  (e.g. an unbounded `WITH RECURSIVE`) is `UNVERIFIABLE` ("query timeout"). At most
+  10,000 rows are fetched. When the cap is hit, `observed.truncated: true` is
+  recorded: a count/rows expectation smaller than the cap is then a definite
+  `FAIL`, and a larger one is `UNVERIFIABLE`.
+- `http_ok` `timeout_s` (default 15 s) is a **total** deadline covering connect,
+  headers and the whole body, not just a per-read timeout. A slow-trickle body is
+  aborted at the deadline and is `UNVERIFIABLE` (`observed.timed_out`).
 - `db_row_matches` accepts read-only queries only (`SELECT`/`WITH` for sqlite, with
   `PRAGMA query_only` as a second enforcement layer); anything else is rejected
   before execution. Multi-statement batches (`SELECT 1; DROP TABLE x`) are refused
@@ -109,7 +172,9 @@ Chain (audit):
   Known limitations: the gate is part of the claim payload). It is NOT
   sandboxed: the command runs with the verifier's full OS privileges. Bounds are a
   hard timeout (default 30 s; `timeout_s` that is `null`, non-numeric, non-finite
-  or ≤ 0 is rejected as `UNVERIFIABLE` rather than meaning "wait forever"), no
+  or ≤ 0 is rejected as `UNVERIFIABLE` rather than meaning "wait forever"; hitting
+  the timeout is `UNVERIFIABLE` with `observed.timed_out`, since the exit code
+  was never observed), no
   stdin, and STREAMING output capture with a hard byte cap (`max_output_bytes`,
   default 64 MiB): stdout is hashed and counted chunk-by-chunk with only a 1 KiB
   head excerpt buffered; exceeding the cap FAILs with
@@ -136,10 +201,29 @@ Chain (audit):
 - `file_exists` with `modified_within_s` FAILs when the file's mtime is more than
   60 s in the future (`observed.mtime_future: true`) — otherwise a future-dated
   file would satisfy "modified recently" forever.
-- `exit_code` RE-RUNS the command at verify time; it does not observe the claimer's
-  original execution. A receipt therefore attests "this command exits N *now*," not
-  "the agent's run exited N." Use it only for idempotent checks; verify side-effecting
-  work via its effects (`file_exists`, `db_row_matches`) instead.
+- `exit_code` RE-RUNS the command itself when the claim is filed; it does not
+  observe the claimer's original execution. A receipt therefore attests "this
+  command exited N *at `checked_at`*," not "the agent's run exited N." Use it only
+  for idempotent checks; verify side-effecting work via its effects
+  (`file_exists`, `db_row_matches`) instead. (All probing happens at claim time;
+  verification is an offline authenticity check and never re-runs anything.)
+
+## Storage and crash recovery
+
+- Default root: `~/.verieffect` (Windows `%USERPROFILE%\.verieffect`), overridable
+  with `VERIEFFECT_HOME`. Through 0.1.0a1 the default was `./data` under the CWD. If
+  that legacy directory has keys and the per-user root does not exist, the CLI
+  prints the exact move command and refuses to create a second key. It never
+  moves files itself.
+- Keys are created atomically: a temp file is opened `O_CREAT|O_EXCL` with mode
+  0600, fsynced and then `os.replace`d into place. A missing `.pub` is regenerated
+  from the private key.
+- A torn last line (crash mid-append) blocks new claims for that agent with a
+  structured error. `verieffect repair --agent <id>` moves the torn line verbatim
+  to `<chain>.torn`, truncates the chain to the last good receipt and appends a
+  signed `kind: "repair_note"` receipt with verdict `UNVERIFIABLE`. That receipt
+  records the torn line's size and sha256. Only a torn *tail* is repaired. Damage
+  further up is refused, and you should audit it.
 
 ## Threat model (what receipts do and don't prove)
 
@@ -152,6 +236,8 @@ chain is audited with `--agent`) belongs to the claimed agent.
 1. **Interpretation.** The claimer chooses `target` and `expect`. A receipt proves
    *this* check ran, not that it was the *right* check. Mitigation: claims-as-code —
    expectations should come from the pipeline spec, not from the agent under audit.
+   Roadmap: operator-owned named checks (`verieffect check <name>`). The operator
+   defines the target and expectations, and the agent can only name the check.
 2. **Tail truncation.** Verification walks forward from genesis, so editing or
    mid-chain deletion is detected — but removing the *newest* receipts is invisible
    to a forward walk. Mitigation: anchor the chain head externally (publish

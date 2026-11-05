@@ -33,3 +33,6 @@ verieffect = "verieffect.cli:main"
 
 [tool.setuptools]
 packages = ["verieffect"]
+# the standalone offline verifier is a top-level module (zero internal
+# imports by design) — ship it in the wheel next to the package
+py-modules = ["verify_receipt"]

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""verieffect test suite — run with .venv/Scripts/python.exe tests/test_all.py"""
+"""verieffect test suite — run with .venv/Scripts/python.exe tests/test_all.py
+
+Also collectable by pytest (test_suite below); nothing runs at import time."""
 import json
 import os
 import subprocess
@@ -35,7 +37,7 @@ def check(name, cond):
     print(("  PASS " if cond else "  FAIL ") + name)
 
 
-with tempfile.TemporaryDirectory() as tmp:
+def _run_all(tmp):
     tmp = Path(tmp)
 
     print("== keyring ==")
@@ -150,7 +152,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("non-SELECT refused -> UNVERIFIABLE", v == UNVERIFIABLE)
     con = sqlite3.connect(str(dbp)); n = con.execute("SELECT COUNT(*) FROM fills").fetchone()[0]; con.close()
     check("refused write left table intact", n == 2)
-    obs, v = probe_db_row_matches(str(tmp / "nope.db"), {"query": "SELECT 1"})
+    obs, v = probe_db_row_matches(str(tmp / "nope.db"), {"query": "SELECT 1", "row_count": 1})
     check("missing db -> FAIL not UNVERIFIABLE", v == FAIL)
 
     print("== db_row_matches (jsonl ledger) ==")
@@ -213,7 +215,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check("nonzero exit vs default 0 -> FAIL", v == FAIL)
     obs, v = probe_exit_code(f'"{PY}" -c "import time; time.sleep(30)"',
                              {**SHELL_OK, "timeout_s": 2})
-    check("timeout -> FAIL with timed_out flag", v == FAIL and obs.get("timed_out") is True)
+    # round 2 item 8: a timeout means the exit code was never observed
+    check("timeout -> UNVERIFIABLE with timed_out flag (not FAIL)",
+          v == UNVERIFIABLE and obs.get("timed_out") is True)
 
     # M2: timeout must kill the whole tree, not just the shell
     import time as _time
@@ -251,7 +255,7 @@ with tempfile.TemporaryDirectory() as tmp:
             n_after = _count_child(orphan_marker)
         check(f"timeout kills child process tree, not just the shell "
               f"({orphan_marker}: {n_before} before, {n_after} after)",
-              v == FAIL and obs.get("timed_out") is True
+              v == UNVERIFIABLE and obs.get("timed_out") is True
               and n_after is not None and n_after <= n_before)
 
     # M1/M2: unbounded / garbage timeout_s is refused, never 'wait forever'
@@ -279,7 +283,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("'selectfoo' rejected by keyword guard", v == UNVERIFIABLE and "refused" in str(obs.get("error", "")))
     obs, v = probe_db_row_matches(f"sqlite:///{sq.as_posix()}", {"query": "SELECT COUNT(*) FROM t", "rows": [[0]]})
     check("legit SELECT still passes guard", v == PASS)
-    obs, v = probe_db_row_matches(f"sqlite:///{sq.as_posix()}", {"query": "select"})
+    obs, v = probe_db_row_matches(f"sqlite:///{sq.as_posix()}", {"query": "select", "row_count": 0})
     check("bare 'select' (keyword + EOL) reaches sqlite, errors cleanly",
           v == UNVERIFIABLE and "refused" not in str(obs.get("error", "")))
 
@@ -382,11 +386,12 @@ with tempfile.TemporaryDirectory() as tmp:
     _bc.execute("CREATE TABLE b (data BLOB, big BLOB)")
     _bc.execute("INSERT INTO b VALUES (x'00ff10', randomblob(5000))")
     _bc.commit(); _bc.close()
-    # 9e999 parses as float('inf') in --expect too (json.loads accepts it)
+    # 9e999 parses as float('inf') in --expect too (json.loads accepts it).
+    # (round 2: unknown keys are now rejected, so the inf rides in `rows`)
     cp_blob = subprocess.run(
         [PY, "-m", "verieffect.cli", "claim", "db_row_matches",
          "--agent", "blob-agent", "--target", f"sqlite:///{blob_db.as_posix()}",
-         "--expect", '{"query": "SELECT data, big, 9e999 FROM b", "rows": [[1]], "junk": 9e999}',
+         "--expect", '{"query": "SELECT data, big, 9e999 FROM b", "rows": [[9e999]]}',
          "--out", str(tmp / "blob_receipt.json")],
         capture_output=True, text=True, cwd=str(ROOT), env=env)
     blob_rec = {}
@@ -404,7 +409,7 @@ with tempfile.TemporaryDirectory() as tmp:
           and isinstance(row0[1], dict) and row0[1].get("_bytes_truncated") is True
           and len(row0[1].get("_bytes_hex", "")) == 4096 and row0[1].get("_bytes_len") == 5000
           and row0[2] == "_nonfinite:inf"
-          and blob_rec.get("expect", {}).get("junk") == "_nonfinite:inf")
+          and blob_rec.get("expect", {}).get("rows") == [["_nonfinite:inf"]])
     cp_blob_v = subprocess.run(
         [PY, str(ROOT / "verify_receipt.py"),
          "--pubkey", str(tmp / "cli_home" / "keys" / "verieffect_ed25519.pub"),
@@ -869,7 +874,516 @@ with tempfile.TemporaryDirectory() as tmp:
               for s in loader_cases)
           and vr.strict_loads('{"a":1}') == core_strict_loads('{"a":1}') == {"a": 1})
 
-print()
-n_pass = sum(1 for _, ok in results if ok)
-print(f"RESULT: {n_pass}/{len(results)} passed")
-sys.exit(0 if n_pass == len(results) else 1)
+    # ================================================================ ROUND 2
+    import socket as _socket
+    import threading as _thr
+    import verieffect.core as vcore
+    import verieffect.cli as vcli
+    import verieffect.probes as vprobes
+
+    def _cli(*argv, cli_env=None):
+        return subprocess.run([PY, "-m", "verieffect.cli", *argv],
+                              capture_output=True, text=True, cwd=str(ROOT),
+                              env=cli_env or env, encoding="utf-8", errors="replace")
+
+    print("== round 2: strict expect schemas (item 1) ==")
+    one = tmp / "one_byte.bin"
+    one.write_bytes(b"x")
+    obs, v = probe_file_exists(str(one), {"min_byte": 1048576})
+    check("file_exists typo key 'min_byte' -> UNVERIFIABLE naming the key (was false PASS)",
+          v == UNVERIFIABLE and "min_byte" in str(obs.get("error", ""))
+          and obs.get("unknown_keys") == ["min_byte"])
+    obs, v = probe_file_exists(str(one), [])
+    check("file_exists expect=[] (non-dict) -> UNVERIFIABLE (was false PASS)", v == UNVERIFIABLE)
+    obs, v = probe_file_exists(str(one), {"min_bytes": "1048576"})
+    check("file_exists min_bytes as string -> UNVERIFIABLE (type-checked)", v == UNVERIFIABLE)
+    obs, v = probe_file_exists(str(one), {"min_bytes": 1})
+    check("file_exists valid min_bytes still PASSes", v == PASS)
+    obs, v = probe_http_ok("http://127.0.0.1:1/", {"stauts": 200})
+    check("http_ok unknown key -> UNVERIFIABLE before any request",
+          v == UNVERIFIABLE and "stauts" in str(obs.get("error", "")))
+    obs, v = probe_http_ok("http://127.0.0.1:1/", "200")
+    check("http_ok non-dict expect -> UNVERIFIABLE", v == UNVERIFIABLE)
+    obs, v = probe_exit_code(f'"{PY}" -c "print(1)"', {**SHELL_OK, "exitcode": 0})
+    check("exit_code unknown key 'exitcode' -> UNVERIFIABLE",
+          v == UNVERIFIABLE and "exitcode" in str(obs.get("error", "")))
+    obs, v = probe_db_row_matches(str(dbp), {"query": "SELECT * FROM fills",
+                                             "row_count": 2, "rowcount": 99})
+    check("sqlite unknown key 'rowcount' -> UNVERIFIABLE",
+          v == UNVERIFIABLE and "rowcount" in str(obs.get("error", "")))
+    obs, v = probe_db_row_matches(str(jl), {"match": {"ticker": "NVDA"}, "occurence": "any"})
+    check("jsonl typo 'occurence' -> UNVERIFIABLE",
+          v == UNVERIFIABLE and "occurence" in str(obs.get("error", "")))
+    obs, v = probe_db_row_matches(str(jj), {"fields": {"cash": 999266.8}, "field": {"cash": 1}})
+    check("json unknown key 'field' -> UNVERIFIABLE",
+          v == UNVERIFIABLE and "field" in obs.get("unknown_keys", []))
+    obs, v = probe_db_row_matches(str(jl), [])
+    check("db_row_matches expect=[] -> UNVERIFIABLE", v == UNVERIFIABLE)
+    obs, v = probe_db_row_matches(str(jl), {"match": {"ticker": "NVDA"}, "occurrence": "sometimes"})
+    check("jsonl invalid occurrence value -> UNVERIFIABLE", v == UNVERIFIABLE)
+    obs, v = probe_db_row_matches(str(jl), {"match": {"_count": 3, "qty": 1}, "occurrence": "count"})
+    check("jsonl occurrence=count with extra match keys -> UNVERIFIABLE (were silently ignored)",
+          v == UNVERIFIABLE)
+    obs, v = probe_db_row_matches(str(jl), {"match": {"_count": 3}, "occurrence": "count"})
+    check("jsonl occurrence=count exact -> PASS", v == PASS)
+    typo_out = tmp / "typo_receipt.json"
+    cp_typo = _cli("claim", "file_exists", "--agent", "r2-agent", "--target", str(one),
+                   "--expect", json.dumps({"min_byte": 1048576}), "--out", str(typo_out))
+    typo_rec = json.loads(typo_out.read_text(encoding="utf-8")) if typo_out.exists() else {}
+    check("CLI typo key: exit 3 + UNVERIFIABLE receipt (was exit 0 PASS)",
+          cp_typo.returncode == 3 and typo_rec.get("verdict") == "UNVERIFIABLE")
+    list_out = tmp / "list_receipt.json"
+    cp_list = _cli("claim", "file_exists", "--agent", "r2-agent", "--target", str(one),
+                   "--expect", "[]", "--out", str(list_out))
+    list_rec = json.loads(list_out.read_text(encoding="utf-8")) if list_out.exists() else {}
+    check("CLI --expect '[]': exit 3, receipt expect still an object (schema-valid)",
+          cp_list.returncode == 3 and list_rec.get("verdict") == "UNVERIFIABLE"
+          and core_schema_errors(list_rec) == []
+          and list_rec.get("expect") == {"_non_object_expect": []})
+
+    print("== round 2: occurrence any is single-row (item 2) ==")
+    jl_any = tmp / "any.jsonl"
+    jl_any.write_text('{"side":"buy","qty":5}\n{"side":"sell","qty":10}\n', encoding="utf-8")
+    obs, v = probe_db_row_matches(str(jl_any), {"occurrence": "any",
+                                                "match": {"side": "buy", "qty": 10}})
+    check("any: fields satisfied only ACROSS rows -> FAIL (was false PASS)",
+          v == FAIL and obs.get("any_match") is False)
+    obs, v = probe_db_row_matches(str(jl_any), {"occurrence": "any",
+                                                "match": {"side": "buy", "qty": 5}})
+    check("any: one row satisfies every field -> PASS",
+          v == PASS and obs.get("selected") == {"side": "buy", "qty": 5})
+
+    print("== round 2: exact numeric compare (item 3) ==")
+    jl_big = tmp / "bigint.jsonl"
+    jl_big.write_text('{"n": 9007199254740993}\n', encoding="utf-8")
+    obs, v = probe_db_row_matches(str(jl_big), {"match": {"n": 9007199254740992}})
+    check("2**53+1 does NOT match 2**53 (exact int compare; was false PASS)", v == FAIL)
+    obs, v = probe_db_row_matches(str(jl_big), {"match": {"n": 9007199254740993}})
+    check("exact big int matches itself", v == PASS)
+    obs, v = probe_db_row_matches(str(jl_big), {"match": {"n": 9007199254740992.0}})
+    check("big int vs nearby float -> FAIL (no float() rounding)", v == FAIL)
+    obs, v = probe_db_row_matches(str(dbp), {"query": "SELECT 9007199254740993",
+                                             "rows": [[9007199254740992]]})
+    check("sqlite big int compared exactly -> FAIL", v == FAIL)
+    obs, v = probe_db_row_matches(str(jl2), {"match": {"qty": 1.0}})
+    check("int 1 vs float 1.0 still equal", v == PASS)
+    jl_nest = tmp / "nest.jsonl"
+    jl_nest.write_text('{"tags": [1, 2]}\n', encoding="utf-8")
+    obs, v = probe_db_row_matches(str(jl_nest), {"match": {"tags": [True, 2]}})
+    check("bool inside a list never matches a number", v == FAIL)
+    obs, v = probe_db_row_matches(str(jl_nest), {"match": {"tags": [1, 2]}})
+    check("list of ints matches element-wise", v == PASS)
+
+    print("== round 2: file_exists requires a regular file (item 4) ==")
+    a_dir = tmp / "a_dir"
+    a_dir.mkdir()
+    obs, v = probe_file_exists(str(a_dir), {})
+    check("file_exists on a directory -> FAIL with is_dir (was false PASS)",
+          v == FAIL and obs.get("is_dir") is True)
+    obs, v = probe_file_exists(str(a_dir), {"min_bytes": 0})
+    check("directory + min_bytes 0 -> FAIL", v == FAIL)
+    obs, v = probe_file_exists(str(f), {})
+    check("regular file + {} -> PASS (existence is the documented assertion)",
+          v == PASS and obs.get("is_dir") is False and obs.get("is_regular_file") is True)
+    d_json = tmp / "dir.json"
+    d_json.mkdir()
+    obs, v = probe_db_row_matches(str(d_json), {"fields": {"a": 1}})
+    check("db_row_matches on a directory -> FAIL", v == FAIL)
+
+    print("== round 2: empty assertions (item 5) ==")
+    empty_db = tmp / "empty.db"
+    _c = sqlite3.connect(str(empty_db))
+    _c.execute("CREATE TABLE t (x INTEGER)")
+    _c.commit()
+    _c.close()
+    obs, v = probe_db_row_matches(str(empty_db), {"query": "SELECT * FROM t"})
+    check("sqlite with no rows/row_count -> UNVERIFIABLE 'no assertion' (was false PASS)",
+          v == UNVERIFIABLE and "no assertion" in str(obs.get("error", "")))
+    obs, v = probe_db_row_matches(str(empty_db), {"query": "SELECT * FROM t", "row_count": 0})
+    check("empty table + row_count 0 -> PASS", v == PASS)
+    obs, v = probe_db_row_matches(str(empty_db), {"query": "SELECT * FROM t", "rows": []})
+    check("empty table + rows [] -> PASS", v == PASS)
+    obs, v = probe_db_row_matches(str(jj), {"fields": {}})
+    check("json fields {} -> UNVERIFIABLE 'no assertion'",
+          v == UNVERIFIABLE and "no assertion" in str(obs.get("error", "")))
+
+    print("== round 2: null semantics (item 6) ==")
+    jl_null = tmp / "null.jsonl"
+    jl_null.write_text('{"a": null, "id": 1}\n', encoding="utf-8")
+    jl_absent = tmp / "absent.jsonl"
+    jl_absent.write_text('{"b": 1, "id": 1}\n', encoding="utf-8")
+    obs, v = probe_db_row_matches(str(jl_null), {"match": {"a": None}})
+    check("match null vs explicit JSON null -> PASS", v == PASS)
+    obs, v = probe_db_row_matches(str(jl_absent), {"match": {"a": None}})
+    check("match null vs ABSENT field -> FAIL (absent != null)",
+          v == FAIL and obs["match_results"]["a"]["observed"] is not None)
+    obs, v = probe_db_row_matches(str(jl_absent), {"where": {"a": None}, "match": {"id": 1}})
+    check("where null does not select rows lacking the field",
+          v == FAIL and obs.get("matched_rows") == 0)
+    jdoc_null = tmp / "nulldoc.json"
+    jdoc_null.write_text('{"x": null}', encoding="utf-8")
+    obs, v = probe_db_row_matches(str(jdoc_null), {"fields": {"x": None}})
+    check("json fields null vs explicit null -> PASS", v == PASS)
+    obs, v = probe_db_row_matches(str(jdoc_null), {"fields": {"y": None}})
+    check("json fields null vs absent path -> FAIL", v == FAIL)
+
+    print("== round 2: verifier gates + exit codes (items 7, 9) ==")
+    empty_chain = write_lines("empty.jsonl", [])
+    cpe1 = run_vr("--chain", "--require-verdict", "PASS", empty_chain)
+    check("empty chain + --require-verdict PASS -> exit 1 + 'no receipts' (was exit 0)",
+          cpe1.returncode == 1 and "no receipts" in cpe1.stdout)
+    cpe0 = run_vr("--chain", empty_chain)
+    check("empty chain (authenticity mode) -> exit 1 + 'no receipts'",
+          cpe0.returncode == 1 and "no receipts" in cpe0.stdout)
+    ag_rec = make_chain([("agent-x", "PASS")])[0]
+    ag_p = hd / "agent_x.json"
+    ag_p.write_text(json.dumps(ag_rec), encoding="utf-8")
+    cpag1 = run_vr("--agent", "someone-else", str(ag_p))
+    check("single receipt + wrong --agent -> exit 1 AGENT MISMATCH (was ignored)",
+          cpag1.returncode == 1 and "AGENT MISMATCH" in cpag1.stdout)
+    cpag2 = run_vr("--agent", "agent-x", str(ag_p))
+    check("single receipt + matching --agent -> exit 0", cpag2.returncode == 0)
+    unv_rec = make_chain([("agent-x", "UNVERIFIABLE")])[0]
+    unv_p = hd / "unv.json"
+    unv_p.write_text(json.dumps(unv_rec), encoding="utf-8")
+    cpu1 = run_vr("--require-verdict", "PASS", str(unv_p))
+    check("UNVERIFIABLE receipt + --require-verdict PASS -> exit 3", cpu1.returncode == 3)
+    cpu0 = run_vr(str(unv_p))
+    check("UNVERIFIABLE receipt, authenticity mode -> exit 0", cpu0.returncode == 0)
+    p = write_lines("pu.jsonl", [json.dumps(x) for x in
+                                 make_chain([("pu", "PASS"), ("pu", "UNVERIFIABLE")])])
+    cpu2 = run_vr("--chain", "--require-verdict", "PASS", p)
+    check("chain PASS+UNVERIFIABLE + require PASS -> exit 3", cpu2.returncode == 3)
+    p = write_lines("uf.jsonl", [json.dumps(x) for x in
+                                 make_chain([("uf", "UNVERIFIABLE"), ("uf", "FAIL")])])
+    cpu3 = run_vr("--chain", "--require-verdict", "PASS", p)
+    check("chain UNVERIFIABLE+FAIL + require PASS -> exit 1 (FAIL dominates)",
+          cpu3.returncode == 1)
+
+    print("== round 2: environment failures are UNVERIFIABLE (item 8) ==")
+    obs, v = probe_exit_code("definitely-not-a-real-binary-9x7q --version", SHELL_OK)
+    check(f"exit_code missing binary -> UNVERIFIABLE (was FAIL; rc={obs.get('exit_code')})",
+          v == UNVERIFIABLE and obs.get("error_kind") == "spawn")
+    obs, v = probe_http_ok("http://127.0.0.1:1/", {"timeout_s": 5})
+    check("http_ok connection refused -> UNVERIFIABLE", v == UNVERIFIABLE)
+
+    def _one_shot_server(mode):
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(20)
+        port = srv.getsockname()[1]
+
+        def _serve():
+            conn = None
+            try:
+                conn, _addr = srv.accept()
+                conn.settimeout(20)
+                conn.recv(65536)
+                if mode == "trickle":
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n"
+                                 b"Connection: close\r\n\r\n")
+                    for _i in range(40):
+                        conn.sendall(b"x")
+                        _time.sleep(0.15)
+                else:  # "silent": accept, read the request, never answer
+                    _time.sleep(4)
+            except OSError:
+                pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                srv.close()
+
+        _thr.Thread(target=_serve, daemon=True).start()
+        return port
+
+    port = _one_shot_server("silent")
+    obs, v = probe_http_ok(f"http://127.0.0.1:{port}/", {"timeout_s": 1})
+    check("http_ok server never answers -> UNVERIFIABLE timeout (not FAIL)",
+          v == UNVERIFIABLE and obs.get("error_kind") == "timeout")
+
+    print("== round 2: real deadlines (items 11, 12) ==")
+    port = _one_shot_server("trickle")
+    t0 = _time.monotonic()
+    obs, v = probe_http_ok(f"http://127.0.0.1:{port}/", {"timeout_s": 1})
+    el = _time.monotonic() - t0
+    check("http_ok slow-trickle body past total deadline -> UNVERIFIABLE (was PASS after 4s+)",
+          v == UNVERIFIABLE and obs.get("timed_out") is True)
+    check(f"http_ok slow-trickle aborted near the deadline ({el:.1f}s, timeout_s=1)", el < 3.5)
+    spin_db = tmp / "spin.db"
+    _c = sqlite3.connect(str(spin_db))
+    _c.execute("CREATE TABLE t (x INTEGER)")
+    _c.commit()
+    _c.close()
+    spin_q = ("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) "
+              "SELECT count(*) FROM c")
+    t0 = _time.monotonic()
+    obs, v = probe_db_row_matches(str(spin_db), {"query": spin_q, "row_count": 1,
+                                                 "timeout_s": 1})
+    el = _time.monotonic() - t0
+    check("sqlite infinite WITH RECURSIVE -> UNVERIFIABLE 'query timeout' (ran forever)",
+          v == UNVERIFIABLE and "query timeout" in str(obs.get("error", "")))
+    check(f"sqlite runaway query aborted near the deadline ({el:.1f}s, timeout_s=1)", el < 4)
+    many_q = ("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c LIMIT 20000) "
+              "SELECT x FROM c")
+    obs, v = probe_db_row_matches(str(spin_db), {"query": many_q, "row_count": 20000})
+    check("20000-row result capped at 10000: row_count 20000 -> UNVERIFIABLE + truncated",
+          v == UNVERIFIABLE and obs.get("truncated") is True and obs.get("row_count") == 10000)
+    obs, v = probe_db_row_matches(str(spin_db), {"query": many_q, "row_count": 5})
+    check("truncated result + row_count 5 -> FAIL (definitely more rows)",
+          v == FAIL and obs.get("truncated") is True)
+    obs, v = probe_db_row_matches(str(spin_db), {"query": "SELECT 1", "row_count": 1})
+    check("small result not truncated -> PASS, truncated false",
+          v == PASS and obs.get("truncated") is False)
+    sq_bad = [probe_db_row_matches(str(spin_db), {"query": "SELECT 1", "row_count": 1,
+                                                  "timeout_s": t}) for t in bad_timeouts]
+    check("sqlite: timeout_s None/str/0/-1/bool/inf -> UNVERIFIABLE with reason",
+          all(v_ == UNVERIFIABLE and "timeout_s" in str(o_.get("error", ""))
+              for o_, v_ in sq_bad))
+
+    print("== round 2: chain-read robustness (items 13, 14, 15) ==")
+    r2_store = ChainStore(tmp / "cli_home" / "chains")
+
+    def _seed(agent):
+        return _cli("claim", "file_exists", "--agent", agent, "--target", str(f),
+                    "--expect", "{}").returncode
+
+    # item 13: lone surrogate (JSON escape) as the last chain line
+    check("seed claim (surrogate agent)", _seed("sur") == 0)
+    with r2_store._path("sur").open("ab") as fh_:
+        fh_.write(b'{"v":1,"claim_id":"\\ud800","agent_id":"sur"}\n')
+    cps_a = _cli("audit", "--agent", "sur")
+    check("audit, lone-surrogate last line: exit 1, no traceback (was crash)",
+          cps_a.returncode == 1 and "Traceback" not in cps_a.stderr)
+    cps_k = _cli("checkpoint", "--agent", "sur")
+    check("checkpoint, lone-surrogate last line: exit 2, no traceback (was crash)",
+          cps_k.returncode == 2 and "Traceback" not in cps_k.stderr)
+    cps_c = _cli("claim", "file_exists", "--agent", "sur", "--target", str(f), "--expect", "{}")
+    check("claim onto lone-surrogate tail: exit 2 CLAIM ABORTED, no traceback",
+          cps_c.returncode == 2 and "CLAIM ABORTED" in cps_c.stderr
+          and "Traceback" not in cps_c.stderr)
+    # raw (CESU-style) surrogate bytes: read with errors="replace"
+    check("seed claim (raw-surrogate agent)", _seed("sur2") == 0)
+    with r2_store._path("sur2").open("ab") as fh_:
+        fh_.write(b'{"v":1,"claim_id":"\xed\xa0\x80","agent_id":"sur2"}\n')
+    cps2 = _cli("audit", "--agent", "sur2")
+    check("audit, raw surrogate bytes: exit 1, no traceback",
+          cps2.returncode == 1 and "Traceback" not in cps2.stderr)
+
+    # item 14: pathologically deep nesting
+    check("seed claim (deep agent)", _seed("deep") == 0)
+    with r2_store._path("deep").open("ab") as fh_:
+        fh_.write(b"[" * 200000 + b"\n")
+    cpd_a = _cli("audit", "--agent", "deep")
+    check("audit, 200k-deep line: exit 2 structured 'corrupt line', no traceback",
+          cpd_a.returncode == 2 and "corrupt line" in cpd_a.stderr
+          and "Traceback" not in cpd_a.stderr)
+    cpd_k = _cli("checkpoint", "--agent", "deep")
+    check("checkpoint, 200k-deep line: exit 2, no traceback",
+          cpd_k.returncode == 2 and "Traceback" not in cpd_k.stderr)
+    cpd_c = _cli("claim", "file_exists", "--agent", "deep", "--target", str(f), "--expect", "{}")
+    check("claim onto 200k-deep tail: exit 2 + repair hint, no traceback",
+          cpd_c.returncode == 2 and "repair" in cpd_c.stderr and "Traceback" not in cpd_c.stderr)
+    deep_rec = tmp / "deep_receipt.json"
+    deep_rec.write_text("[" * 200000, encoding="utf-8")
+    cpd_v = _cli("verify", str(deep_rec))
+    check("cli verify on 200k-deep receipt: exit 2, no traceback",
+          cpd_v.returncode == 2 and "Traceback" not in cpd_v.stderr)
+    deep_errs = []
+    for fn_ in (r2_store.read_all, r2_store.last_hash):
+        try:
+            fn_("deep")
+            deep_errs.append("no error")
+        except RuntimeError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            deep_errs.append(type(e).__name__)
+    check(f"core read_all/last_hash: deep nesting -> structured RuntimeError ({deep_errs})",
+          deep_errs == [])
+    # 20k (not 200k): Windows caps a command line at 32767 chars. If this
+    # interpreter's JSON parser survives 20k nesting, the probe/serializer
+    # path must still yield UNVERIFIABLE (3) — never a traceback or exit 4.
+    big_expect = _cli("claim", "file_exists", "--agent", "r2-agent", "--target", str(f),
+                      "--expect", "[" * 20000)
+    check(f"claim with 20k-deep --expect: exit 2/3, no traceback (rc={big_expect.returncode})",
+          big_expect.returncode in (2, 3) and "Traceback" not in big_expect.stderr)
+
+    # item 15: torn UTF-8 tail (crash mid-append) + `verieffect repair`
+    check("seed claim (torn agent)", _seed("torn") == 0)
+    tp_ = r2_store._path("torn")
+    good_before = tp_.read_bytes()
+    torn_bytes = b'{"agent_id": "torn", "claim_id": "\xe2\x82'  # cut mid-character
+    with tp_.open("ab") as fh_:
+        fh_.write(torn_bytes)
+    try:
+        r2_store.last_hash("torn")
+        check("last_hash on torn UTF-8 tail -> structured RuntimeError", False)
+    except RuntimeError as e:
+        check("last_hash on torn UTF-8 tail -> structured RuntimeError naming repair "
+              "(was UnicodeDecodeError)", "repair" in str(e))
+    except Exception as e:  # noqa: BLE001
+        check(f"last_hash on torn UTF-8 tail -> structured RuntimeError (raised {e!r})", False)
+    cpt1 = _cli("claim", "file_exists", "--agent", "torn", "--target", str(f), "--expect", "{}")
+    check("claim onto torn tail: exit 2 + 'verieffect repair' hint, no traceback",
+          cpt1.returncode == 2 and "verieffect repair" in cpt1.stderr
+          and "Traceback" not in cpt1.stderr)
+    cpt2 = _cli("repair", "--agent", "torn")
+    sidecar_ = tp_.with_name(tp_.name + ".torn")
+    check("repair: exit 0, torn bytes moved verbatim to .torn sidecar",
+          cpt2.returncode == 0 and sidecar_.exists()
+          and sidecar_.read_bytes() == torn_bytes + b"\n")
+    check("repair: chain prefix preserved byte-for-byte", tp_.read_bytes().startswith(good_before))
+    torn_recs = r2_store.read_all("torn")
+    check("repair: signed repair_note receipt appended (verdict UNVERIFIABLE)",
+          len(torn_recs) == 2 and torn_recs[-1].get("kind") == "repair_note"
+          and torn_recs[-1].get("verdict") == "UNVERIFIABLE"
+          and verify_receipt(torn_recs[-1], Path(cli_pub_path).read_text())[0])
+    cpt3 = _cli("claim", "file_exists", "--agent", "torn", "--target", str(f), "--expect", "{}")
+    check("claims continue after repair (exit 0)", cpt3.returncode == 0)
+    cpt4 = _cli("audit", "--agent", "torn")
+    check("repaired chain audits clean (3 receipts)",
+          cpt4.returncode == 0 and "audited 3 receipts" in cpt4.stdout)
+    cpt5 = _cli("repair", "--agent", "torn")
+    check("repair on an intact chain is a no-op (exit 0, 'intact')",
+          cpt5.returncode == 0 and "intact" in cpt5.stdout)
+    # append() never glues a receipt onto a newline-less tail
+    nl_store = ChainStore(tmp / "nl_chains")
+    nl_r1 = sign_receipt(receipt_body("n1", "nl", "file_exists", "x", {}, {}, "PASS",
+                                      GENESIS_HASH), priv)
+    nl_store._path("nl").write_text(json.dumps(nl_r1, sort_keys=True), encoding="utf-8")
+    nl_store.append(sign_receipt(receipt_body("n2", "nl", "file_exists", "x", {}, {}, "PASS",
+                                              nl_store.last_hash("nl")), priv))
+    check("append after a newline-less last line starts a fresh line",
+          len(nl_store.read_all("nl")) == 2
+          and verify_chain(nl_store.read_all("nl"), pub_pem) == [])
+
+    print("== round 2: per-user default home (item 16) ==")
+    saved_home = os.environ.pop("VERIEFFECT_HOME", None)
+    try:
+        check("default home resolves to <user home>/.verieffect (not ./data under CWD)",
+              vcli.home() == Path.home() / ".verieffect"
+              and vcli.default_home() == Path.home() / ".verieffect")
+        os.environ["VERIEFFECT_HOME"] = str(tmp / "override_home")
+        check("VERIEFFECT_HOME override still honored", vcli.home() == tmp / "override_home")
+    finally:
+        os.environ.pop("VERIEFFECT_HOME", None)
+        if saved_home is not None:
+            os.environ["VERIEFFECT_HOME"] = saved_home
+    legacy_cwd = tmp / "legacy_cwd"
+    (legacy_cwd / "data" / "keys").mkdir(parents=True)
+    fake_home = tmp / "fake_home"
+    fake_home.mkdir()
+    lenv = {k_: v_ for k_, v_ in os.environ.items() if k_ != "VERIEFFECT_HOME"}
+    lenv.update(HOME=str(fake_home), USERPROFILE=str(fake_home), PYTHONPATH=str(ROOT))
+    cpl = subprocess.run(
+        [PY, "-m", "verieffect.cli", "claim", "file_exists", "--agent", "mig",
+         "--target", str(f), "--expect", "{}"],
+        capture_output=True, text=True, cwd=str(legacy_cwd), env=lenv,
+        encoding="utf-8", errors="replace")
+    check("legacy ./data/keys, no per-user home: notice + exact move command, exit 2, "
+          "nothing moved or created",
+          cpl.returncode == 2 and "NOTICE" in cpl.stderr and ".verieffect" in cpl.stderr
+          and ("move " in cpl.stderr or "mv " in cpl.stderr)
+          and (legacy_cwd / "data" / "keys").exists()
+          and not (fake_home / ".verieffect").exists())
+
+    print("== round 2: lock + key hardening (items 17, 18) ==")
+    lock_target = tmp / "lockleak" / "chain_x.jsonl"
+    lock_target.parent.mkdir()
+
+    def _deny_open(*_a, **_k):
+        raise PermissionError("simulated: lock file not openable")
+
+    vcore.open = _deny_open  # shadows the builtin inside core only
+    try:
+        try:
+            with vcore._file_lock(lock_target):
+                pass
+            lock_raised = False
+        except PermissionError:
+            lock_raised = True
+    finally:
+        del vcore.open
+    tkey_ = (_thr.get_ident(), str(lock_target))
+    check("_file_lock: open() failure propagates, leaves NO stale depth (M6)",
+          lock_raised and tkey_ not in vcore._depth)
+    with vcore._file_lock(lock_target):
+        took_os_lock = lock_target.with_suffix(lock_target.suffix + ".lock").exists()
+    check("_file_lock after a failed open takes the real OS lock again", took_os_lock)
+    other_ok = []
+
+    def _other_thread():
+        with vcore._file_lock(lock_target):
+            other_ok.append(True)
+
+    th_ = _thr.Thread(target=_other_thread, daemon=True)
+    th_.start()
+    th_.join(10)
+    check("_file_lock: in-process lock released after failed open (other thread proceeds)",
+          other_ok == [True])
+
+    kd = tmp / "atomic_keys"
+    real_replace = os.replace
+
+    def _boom(*_a, **_k):
+        raise OSError("simulated crash during key install")
+
+    os.replace = _boom
+    try:
+        try:
+            Keyring(kd).load_or_create()
+            key_raised = False
+        except OSError:
+            key_raised = True
+    finally:
+        os.replace = real_replace
+    check("key creation failure leaves no partial private key and no temp files (L5)",
+          key_raised and not (kd / "verieffect_ed25519.pem").exists()
+          and list(kd.glob("*.tmp")) == [])
+    kr_a = Keyring(kd)
+    k_a = kr_a.load_or_create()
+    check("key creation after a failure succeeds, both files present",
+          kr_a.priv_path.exists() and kr_a.pub_path.exists() and list(kd.glob("*.tmp")) == [])
+    if os.name == "posix":
+        check("private key created with mode 0600",
+              (kr_a.priv_path.stat().st_mode & 0o777) == 0o600)
+    kr_a.pub_path.unlink()
+    k_b = Keyring(kd).load_or_create()
+    check("missing .pub (crash between writes) regenerated from the private key",
+          kr_a.pub_path.exists()
+          and k_b.public_key().public_bytes_raw() == k_a.public_key().public_bytes_raw())
+
+    print("== round 2: packaging + docs (items 20, 21) ==")
+    check("probes docstring cites docs/receipt-schema.md, not SPEC.md",
+          "SPEC.md" not in (vprobes.__doc__ or "")
+          and "docs/receipt-schema.md" in (vprobes.__doc__ or ""))
+    pyproj = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    check("pyproject ships verify_receipt.py in the wheel (py-modules)",
+          'py-modules = ["verify_receipt"]' in pyproj)
+
+
+def main():
+    results.clear()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        _run_all(tmp)
+    print()
+    n_pass = sum(1 for _, ok in results if ok)
+    print(f"RESULT: {n_pass}/{len(results)} passed")
+    return 0 if n_pass == len(results) else 1
+
+
+def test_suite():
+    """pytest entry point: runs every check() and fails listing the failures."""
+    results.clear()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        _run_all(tmp)
+    failed = [name for name, ok in results if not ok]
+    assert not failed, f"{len(failed)} check(s) failed: {failed}"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,11 +9,19 @@ Usage:
   verieffect verify receipt.json            # single receipt (offline)
   verieffect audit --agent my-agent         # full chain audit
   verieffect checkpoint --agent my-agent    # head+count for external anchoring
+  verieffect repair --agent my-agent        # move a torn chain tail to a sidecar
   verieffect pubkey                          # print verifier public key (PEM)
 
-Data/key layout (default under ./data, override with VERIEFFECT_HOME):
-  data/keys/verieffect_ed25519.{pem,pub}
-  data/chains/chain_<agent>_<hash8>.jsonl   (legacy chain_<agent>.jsonl still read)
+Probing happens when the claim is filed; `verify`/`audit` check receipt
+authenticity and chain integrity offline — they never re-probe.
+
+Exit codes — claim: 0 PASS, 1 FAIL, 3 UNVERIFIABLE, 2 usage error / claim
+aborted (no receipt written), 4 internal error.
+
+Data/key layout (default per-user: ~/.verieffect, i.e. %USERPROFILE%\\.verieffect
+on Windows; override with VERIEFFECT_HOME):
+  <home>/keys/verieffect_ed25519.{pem,pub}
+  <home>/chains/chain_<agent>_<hash8>.jsonl   (legacy chain_<agent>.jsonl still read)
 """
 from __future__ import annotations
 
@@ -25,8 +33,8 @@ import uuid
 from pathlib import Path
 
 from .core import (
-    ChainStore, Keyring, receipt_body, schema_errors, sign_receipt,
-    strict_loads, verify_chain, verify_receipt,
+    ChainStore, Keyring, receipt_body, receipt_hash, schema_errors,
+    sign_receipt, strict_loads, verify_chain, verify_receipt,
 )
 from .probes import PROBES
 
@@ -38,24 +46,99 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
+EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_UNVERIFIABLE, EXIT_INTERNAL = 0, 1, 2, 3, 4
+_VERDICT_EXIT = {"PASS": EXIT_PASS, "FAIL": EXIT_FAIL}
+
+
+def default_home() -> Path:
+    """Per-user state dir: %USERPROFILE%\\.verieffect on Windows,
+    ~/.verieffect elsewhere. Independent of the current directory, so every
+    invocation uses ONE key and ONE set of chains."""
+    return Path.home() / ".verieffect"
+
 
 def home() -> Path:
-    return Path(os.environ.get("VERIEFFECT_HOME", Path.cwd() / "data"))
+    env = os.environ.get("VERIEFFECT_HOME")
+    if env:
+        return Path(env)
+    return default_home()
+
+
+def _legacy_home() -> Path | None:
+    """Through 0.1.0a1 the default was ./data under the CWD. Returns that dir when it
+    holds keys, the per-user home does not exist yet, and VERIEFFECT_HOME is
+    unset — i.e. when a migration notice is due."""
+    if os.environ.get("VERIEFFECT_HOME"):
+        return None
+    legacy = Path.cwd() / "data"
+    try:
+        if (legacy / "keys").exists() and not default_home().exists():
+            return legacy
+    except OSError:
+        return None
+    return None
+
+
+def _migration_check(creates_state: bool) -> int | None:
+    """Print the migration notice when due. For commands that would create a
+    NEW key/chain in the per-user home (claim, pubkey, repair) we stop
+    instead — silently minting a second key would split the user's chains.
+    Never moves anything automatically."""
+    legacy = _legacy_home()
+    if legacy is None:
+        return None
+    new = default_home()
+    if os.name == "nt":
+        move = f'move "{legacy}" "{new}"'
+        keep = f'set VERIEFFECT_HOME={legacy}'
+    else:
+        move = f'mv "{legacy}" "{new}"'
+        keep = f'export VERIEFFECT_HOME="{legacy}"'
+    print("NOTICE: Verieffect now keeps keys and chains in a per-user directory\n"
+          f"  {new}\n"
+          f"but found existing keys in the old CWD-relative location\n"
+          f"  {legacy}\n"
+          "To migrate (one time), move it:\n"
+          f"  {move}\n"
+          "or keep using it in place:\n"
+          f"  {keep}", file=sys.stderr)
+    if creates_state:
+        print("Refusing to create a new signing key in the per-user directory "
+              "until you choose (it would split your receipt chains).",
+              file=sys.stderr)
+        return EXIT_USAGE
+    return None
+
+
+def _pubkey_text(args: argparse.Namespace) -> str:
+    return Path(args.pubkey or (home() / "keys" / "verieffect_ed25519.pub")).read_text(
+        encoding="utf-8")
 
 
 def cmd_claim(args: argparse.Namespace) -> int:
     if args.kind not in PROBES:
         print(f"unknown claim kind: {args.kind} (have: {', '.join(PROBES)})",
               file=sys.stderr)
-        return 2
-    try:
-        def _no_nan(x):
-            raise ValueError(f"non-finite JSON constant not allowed: {x}")
-        expect = json.loads(args.expect, parse_constant=_no_nan) if args.expect else {}
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"--expect must be valid JSON (no NaN/Infinity): {e}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
+    if args.expect is None:
+        expect = {}
+    else:
+        try:
+            def _no_nan(x):
+                raise ValueError(f"non-finite JSON constant not allowed: {x}")
+            expect = json.loads(args.expect, parse_constant=_no_nan)
+        except (ValueError, RecursionError) as e:
+            print(f"--expect must be valid JSON (no NaN/Infinity): "
+                  f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+            return EXIT_USAGE
+    # a non-object --expect (e.g. [] or null) is passed to the probe as-is,
+    # which returns UNVERIFIABLE; the receipt's expect field must still be an
+    # object (schema), so the raw value is recorded under a marker key
+    receipt_expect = expect if isinstance(expect, dict) else {"_non_object_expect": expect}
 
+    rc = _migration_check(creates_state=True)
+    if rc is not None:
+        return rc
     store = ChainStore(home() / "chains")
     keyring = Keyring(home() / "keys")
     priv = keyring.load_or_create()
@@ -82,7 +165,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 # receipt_body json_safe()s expect/observed (bytes, inf/nan, ...)
                 body = receipt_body(claim_id=claim_id, agent_id=args.agent,
                                     kind=args.kind, target=args.target,
-                                    expect=expect, observed=observed,
+                                    expect=receipt_expect, observed=observed,
                                     verdict=verdict, prev_hash=prev_hash)
                 receipt = sign_receipt(body, priv)
             except (TypeError, ValueError, RecursionError) as e:
@@ -100,12 +183,12 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 receipt = sign_receipt(body, priv)
             store.append(receipt)
     except RuntimeError as e:
-        # structured error from a corrupt chain tail — match audit's behavior
+        # structured error from a corrupt/torn chain tail — match audit's behavior
         print(f"CLAIM ABORTED: {e}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
     except TimeoutError as e:
         print(f"CLAIM ABORTED: {e}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
 
     out = json.dumps(receipt, indent=2, ensure_ascii=False)
     if args.out:
@@ -117,28 +200,31 @@ def cmd_claim(args: argparse.Namespace) -> int:
             print(f"WARNING: receipt appended to chain but --out write failed: "
                   f"{e}", file=sys.stderr)
     print(out)
-    # exit code: 0 PASS, 1 FAIL/UNVERIFIABLE — scripts can branch on it
-    return 0 if verdict == "PASS" else 1
+    # exit code: 0 PASS, 1 FAIL, 3 UNVERIFIABLE — scripts can branch on it
+    return _VERDICT_EXIT.get(verdict, EXIT_UNVERIFIABLE)
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
     try:
         receipt = strict_loads(args.receipt.read())
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"INVALID: cannot parse receipt JSON: {e}", file=sys.stderr)
-        return 2
+    except (ValueError, RecursionError) as e:
+        print(f"INVALID: cannot parse receipt JSON: {type(e).__name__}: "
+              f"{str(e)[:200]}", file=sys.stderr)
+        return EXIT_USAGE
+    _migration_check(creates_state=False)
     try:
-        pub = Path(args.pubkey or (home() / "keys" / "verieffect_ed25519.pub")).read_text()
-    except OSError as e:
+        pub = _pubkey_text(args)
+    except (OSError, ValueError) as e:
         print(f"INVALID: cannot read public key: {e}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
     ok, why = verify_receipt(receipt, pub)
     schema_errs = schema_errors(receipt)
+    get = receipt.get if isinstance(receipt, dict) else (lambda _k: None)
     if ok:
         out = {"signature_ok": True, "detail": why,
                "schema_valid": not schema_errs,
-               "verdict": receipt.get("verdict"),
-               "claim_id": receipt.get("claim_id")}
+               "verdict": get("verdict"),
+               "claim_id": get("claim_id")}
         if schema_errs:
             out["schema_errors"] = schema_errs
     else:
@@ -146,15 +232,25 @@ def cmd_verify(args: argparse.Namespace) -> int:
         # label them as such rather than echoing a possibly forged "PASS"
         out = {"signature_ok": False, "detail": why,
                "schema_valid": not schema_errs,
-               "unverified_claim": {"verdict": receipt.get("verdict"),
-                                    "claim_id": receipt.get("claim_id")}}
+               "unverified_claim": {"verdict": get("verdict"),
+                                    "claim_id": get("claim_id")}}
         if schema_errs:
             out["schema_errors"] = schema_errs
     print(json.dumps(out, indent=2))
     return 0 if (ok and not schema_errs) else 1
 
 
+def _last_info(receipts: list) -> tuple[str | None, object, object]:
+    """(head_hash or None, claim_id, checked_at) of the last receipt —
+    tolerant of non-object / non-canonicalizable lines."""
+    last = receipts[-1]
+    if not isinstance(last, dict):
+        return None, "?", "?"
+    return receipt_hash(last), last.get("claim_id"), last.get("checked_at")
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
+    _migration_check(creates_state=False)
     store = ChainStore(home() / "chains")
     try:
         receipts = store.read_all(args.agent)
@@ -165,13 +261,16 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(f"no receipts for agent {args.agent}")
         return 2
     try:
-        pub = Path(args.pubkey or (home() / "keys" / "verieffect_ed25519.pub")).read_text()
-    except OSError as e:
+        pub = _pubkey_text(args)
+    except (OSError, ValueError) as e:
         print(f"AUDIT ABORTED: cannot read public key: {e}", file=sys.stderr)
         return 2
     problems = verify_chain(receipts, pub, expected_agent_id=args.agent)
-    from .core import canonical_json, sha256_hex
-    head_hash = sha256_hex(canonical_json(receipts[-1]))
+    head_hash, last_cid, last_ts = _last_info(receipts)
+    if head_hash is None:
+        problems.append("last receipt cannot be hashed (not an object or not "
+                        "canonicalizable) — chain head unhashable")
+        head_hash = "unhashable"
     print(f"audited {len(receipts)} receipts for agent '{args.agent}'")
     # truncation detection: compare against an externally anchored head/count
     if args.expect_count is not None and len(receipts) != args.expect_count:
@@ -183,7 +282,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             f"head mismatch — expected {args.expect_head.strip()[:16]}…, got "
             f"{head_hash[:16]}… (possible tail truncation or regeneration)")
     print(f"chain head: {head_hash}")
-    print(f"last receipt: {receipts[-1].get('claim_id')} @ {receipts[-1].get('checked_at')}")
+    print(f"last receipt: {last_cid} @ {last_ts}")
     if problems:
         print("CHAIN BROKEN / SIGNATURES INVALID:")
         for p in problems:
@@ -205,6 +304,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     audit --expect-head <anchored> / --expect-count <anchored> to detect
     tail truncation and key-holder regeneration.
     """
+    _migration_check(creates_state=False)
     store = ChainStore(home() / "chains")
     try:
         receipts = store.read_all(args.agent)
@@ -214,24 +314,62 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     if not receipts:
         print(f"no receipts for agent {args.agent}", file=sys.stderr)
         return 2
-    from .core import canonical_json, sha256_hex
-    head = sha256_hex(canonical_json(receipts[-1]))
+    head, _cid, as_of = _last_info(receipts)
+    if head is None:
+        print("CHECKPOINT ABORTED: last receipt cannot be hashed (not an object "
+              "or not canonicalizable) — run audit; refusing to anchor a "
+              "corrupt head", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps({"agent_id": args.agent, "count": len(receipts),
-                          "head": head,
-                          "as_of": receipts[-1].get("checked_at")}))
+                          "head": head, "as_of": as_of}))
     else:
         print(f"agent:  {args.agent}")
         print(f"count:  {len(receipts)}")
         print(f"head:   {head}")
-        print(f"as_of:  {receipts[-1].get('checked_at')}")
+        print(f"as_of:  {as_of}")
         print("# anchor this: commit it, stamp it (OpenTimestamps), or post it.")
         print("# audit later with: audit --agent " + args.agent +
               f" --expect-count {len(receipts)} --expect-head {head}")
     return 0
 
 
+def cmd_repair(args: argparse.Namespace) -> int:
+    """Recover a chain whose last line was torn by a crash mid-append."""
+    rc = _migration_check(creates_state=True)
+    if rc is not None:
+        return rc
+    keyring = Keyring(home() / "keys")
+    if not keyring.priv_path.exists():
+        print(f"REPAIR ABORTED: no signing key at {keyring.priv_path}",
+              file=sys.stderr)
+        return 2
+    priv = keyring.load_or_create()
+    store = ChainStore(home() / "chains")
+    try:
+        rep = store.repair_tail(args.agent, priv)
+    except (RuntimeError, TimeoutError, OSError) as e:
+        print(f"REPAIR ABORTED: {e}", file=sys.stderr)
+        return 1
+    status = rep["status"]
+    if status == "repaired":
+        print(f"WARNING: torn tail ({rep['torn_bytes']} bytes) moved to "
+              f"{rep['sidecar']}", file=sys.stderr)
+        print(f"repaired: appended signed repair_note receipt "
+              f"{rep['receipt']['claim_id']} to {rep['chain']}")
+    elif status == "newline_added":
+        print(f"repaired: last receipt was missing its newline ({rep['chain']})")
+    elif status == "intact":
+        print(f"chain tail is intact — nothing to repair ({rep['chain']})")
+    else:
+        print(f"nothing to repair: {status} ({rep['chain']})")
+    return 0
+
+
 def cmd_pubkey(_: argparse.Namespace) -> int:
+    rc = _migration_check(creates_state=True)
+    if rc is not None:
+        return rc
     keyring = Keyring(home() / "keys")
     keyring.load_or_create()
     print(keyring.public_key_pem())
@@ -246,8 +384,9 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("kind", choices=sorted(PROBES))
     c.add_argument("--agent", required=True)
     c.add_argument("--target", required=True,
-                   help="for exit_code: the command is RE-RUN at verify time — "
-                        "use idempotent commands only (see docs/receipt-schema.md)")
+                   help="for exit_code: the command is RE-RUN by Verieffect when "
+                        "the claim is filed — use idempotent commands only "
+                        "(see docs/receipt-schema.md)")
     c.add_argument("--expect", default=None, help="JSON object of expectations")
     c.add_argument("--out", default=None, help="also write receipt to this file")
     c.set_defaults(fn=cmd_claim)
@@ -275,8 +414,21 @@ def main(argv: list[str] | None = None) -> int:
     k.add_argument("--json", action="store_true", help="machine-readable output")
     k.set_defaults(fn=cmd_checkpoint)
 
+    r = sub.add_parser("repair",
+                       help="move a torn (crash-truncated) chain tail to a .torn "
+                            "sidecar and append a signed repair note")
+    r.add_argument("--agent", required=True)
+    r.set_defaults(fn=cmd_repair)
+
     args = ap.parse_args(argv)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except Exception as e:  # noqa: BLE001 — never a bare traceback; distinct exit code
+        print(f"INTERNAL ERROR: {type(e).__name__}: {str(e)[:500]}", file=sys.stderr)
+        if os.environ.get("VERIEFFECT_DEBUG"):
+            import traceback
+            traceback.print_exc()
+        return EXIT_INTERNAL
 
 
 if __name__ == "__main__":

@@ -14,7 +14,9 @@ python -m venv .venv
 ```
 
 Requirements: Python 3.10+. Deps: `cryptography`, `requests`.
-All state (keys, chains) goes under `./data` (gitignored) or `$VERIEFFECT_HOME`.
+All state (keys, chains) goes under the per-user `~/.verieffect`
+(`%USERPROFILE%\.verieffect` on Windows) or `$VERIEFFECT_HOME`. Tests always use
+a scratch `VERIEFFECT_HOME`.
 
 ## Rules of the codebase
 
@@ -30,7 +32,10 @@ All state (keys, chains) goes under `./data` (gitignored) or `$VERIEFFECT_HOME`.
    publishable reference implementation (duplicated helpers are intentional;
    keep them in sync with `verieffect/core.py`).
 5. **Every fix ships with a regression test.** `tests/test_all.py` is a plain
-   script (no pytest) — follow its `check(name, cond)` pattern.
+   script (also collectable by pytest via `test_suite`) — follow its
+   `check(name, cond)` pattern inside `_run_all`.
+6. **Strict `expect` schemas.** Every probe declares its allowed `expect` keys;
+   unknown keys, wrong types and assertion-free expects are UNVERIFIABLE.
 
 ## Adding a probe
 
@@ -40,7 +45,9 @@ All state (keys, chains) goes under `./data` (gitignored) or `$VERIEFFECT_HOME`.
 2. Register it in `PROBES`.
 3. Add tests covering: PASS path, FAIL path, UNVERIFIABLE path (target
    unreachable), and any opt-in gates.
-4. Document target format + every `expect` key in `docs/receipt-schema.md`.
+4. Declare its `expect` key schema (see `FILE_EXISTS_EXPECT` etc. in
+   `probes.py`, validated with `_validate_expect`) and document the target format
+   and every `expect` key in `docs/receipt-schema.md`.
 
 Good first probe ideas: S3 object exists, Docker container running, git commit
 pushed to remote, DNS record matches, Postgres row (via read-only DSN).

@@ -7,11 +7,23 @@ using only `cryptography`. Deliberately zero internal imports. It prints
 INVALID/malformed rather than ever raising on untrusted input.
 
 Usage:
-  python verify_receipt.py --pubkey verieffect_ed25519.pub receipt.json
+  python verify_receipt.py --pubkey verieffect_ed25519.pub receipt.json [--agent myagent]
   python verify_receipt.py --pubkey verieffect_ed25519.pub --chain chain_myagent.jsonl
       [--agent myagent] [--expect-count N] [--expect-head HASH]
-  add --require-verdict PASS to also fail (exit 1) unless every verified
-  receipt carries that verdict (default: exit code reflects authenticity only)
+  add --require-verdict PASS to also gate on the verdict (default: exit code
+  reflects authenticity only)
+
+Exit codes:
+  0  authentic (and, with --require-verdict, every verdict matches)
+  1  invalid / tampered / malformed / agent mismatch / EMPTY chain, or a
+     --require-verdict mismatch involving a non-UNVERIFIABLE verdict
+  2  usage error (argparse)
+  3  authentic, but the --require-verdict gate failed ONLY because of
+     UNVERIFIABLE verdicts (the check could not reach ground truth)
+  4  internal error (a bug in this verifier — please report it)
+
+Verification checks authenticity offline; it never re-runs probes (probing
+happened when the claim was filed).
 
 Chain mode walks FORWARD from genesis, so it detects edited receipts and
 mid-chain deletions. It CANNOT detect tail truncation or regeneration by the
@@ -71,6 +83,7 @@ def strict_loads(text: str):
 
 SCHEMA_VERSION = 1
 GENESIS = "0" * 64
+EXIT_OK, EXIT_INVALID, EXIT_USAGE, EXIT_UNVERIFIABLE, EXIT_INTERNAL = 0, 1, 2, 3, 4
 VALID_VERDICTS = ("PASS", "FAIL", "UNVERIFIABLE")
 
 import re as _re
@@ -163,15 +176,18 @@ def main() -> int:
     ap.add_argument("file", help="receipt .json or chain .jsonl (with --chain)")
     ap.add_argument("--chain", action="store_true")
     ap.add_argument("--agent", default=None,
-                    help="expected agent_id for every receipt in the chain")
+                    help="expected agent_id (single receipt, or every receipt "
+                         "in the chain)")
     ap.add_argument("--expect-count", type=int, default=None,
                     help="externally anchored receipt count — detects tail truncation")
     ap.add_argument("--expect-head", default=None,
                     help="externally anchored sha256 of the last receipt — "
                          "detects truncation/regeneration")
     ap.add_argument("--require-verdict", choices=VALID_VERDICTS, default=None,
-                    help="also exit 1 unless every verified receipt carries this "
-                         "verdict (default: exit code reflects authenticity only)")
+                    help="also exit non-zero unless every verified receipt carries "
+                         "this verdict: 3 if the only mismatches are UNVERIFIABLE "
+                         "verdicts, else 1 (default: exit code reflects "
+                         "authenticity only)")
     args = ap.parse_args()
 
     try:
@@ -203,17 +219,22 @@ def main() -> int:
             parts.append("schema: " + "; ".join(serrs))
         print(f"{status}: {' | '.join(parts)} (claim {cid}, verdict {vd})")
         if not (ok and not serrs):
-            return 1
+            return EXIT_INVALID
+        if args.agent is not None and receipt.get("agent_id") != args.agent:
+            print(f"AGENT MISMATCH: authentic receipt belongs to agent "
+                  f"{receipt.get('agent_id')!r}, required {args.agent!r}")
+            return EXIT_INVALID
         if args.require_verdict is not None and vd != args.require_verdict:
             print(f"VERDICT MISMATCH: authentic receipt has verdict {vd}, "
                   f"required {args.require_verdict}")
-            return 1
-        return 0
+            return EXIT_UNVERIFIABLE if vd == "UNVERIFIABLE" else EXIT_INVALID
+        return EXIT_OK
 
     prev = GENESIS
     n = 0
     bad = 0
-    verdict_mismatch = 0
+    verdict_mismatch = 0          # mismatches where the actual verdict is not UNVERIFIABLE
+    unverifiable_mismatch = 0     # mismatches where the actual verdict is UNVERIFIABLE
     verdict_counts = {vk: 0 for vk in VALID_VERDICTS}
     other_verdicts = 0
     expected_agent = args.agent
@@ -281,7 +302,10 @@ def main() -> int:
             else:
                 other_verdicts += 1
             if args.require_verdict is not None and vd != args.require_verdict:
-                verdict_mismatch += 1
+                if vd == "UNVERIFIABLE":
+                    unverifiable_mismatch += 1
+                else:
+                    verdict_mismatch += 1
                 cid = r.get("claim_id") if isinstance(r, dict) else "?"
                 print(f"  [{n}] {cid}: verdict {vd!r} != required "
                       f"{args.require_verdict}")
@@ -295,6 +319,13 @@ def main() -> int:
                     prev = "unhashable"
                 last = r
 
+    if n == 0:
+        # an empty chain proves nothing: it must never satisfy an
+        # authenticity check or a --require-verdict gate
+        print("chain audit: 0 receipts — no receipts (an empty chain proves nothing)")
+        if args.require_verdict is not None:
+            print(f"verdict requirement ({args.require_verdict}): NOT met — no receipts")
+        return EXIT_INVALID
     head = GENESIS if last is None else prev
     if args.expect_count is not None and n != args.expect_count:
         bad += 1
@@ -311,15 +342,31 @@ def main() -> int:
         vsum += f", {other_verdicts} other/missing"
     print(f"verdicts: {vsum}")
     if args.require_verdict is not None:
+        total_mm = verdict_mismatch + unverifiable_mismatch
         print(f"verdict requirement ({args.require_verdict}): "
-              + ("met" if verdict_mismatch == 0
-                 else f"{verdict_mismatch} receipt(s) differ"))
+              + ("met" if total_mm == 0
+                 else f"{total_mm} receipt(s) differ "
+                      f"({unverifiable_mismatch} UNVERIFIABLE)"))
     if bad == 0 and args.expect_count is None and not args.expect_head:
         print("note: forward-walk intact. Tail truncation/regeneration is only "
               "detectable with --expect-count/--expect-head (anchor the head "
               "externally).")
-    return 1 if (bad or verdict_mismatch) else 0
+    if bad or verdict_mismatch:
+        return EXIT_INVALID
+    if unverifiable_mismatch:
+        return EXIT_UNVERIFIABLE
+    return EXIT_OK
+
+
+def _guarded_main() -> int:
+    """Run main(); any unexpected exception is a verifier bug -> exit 4,
+    never a bare traceback (argparse's SystemExit(2) passes through)."""
+    try:
+        return main()
+    except Exception as e:  # noqa: BLE001
+        print(f"INTERNAL ERROR: {type(e).__name__}: {str(e)[:500]}", file=sys.stderr)
+        return EXIT_INTERNAL
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_guarded_main())

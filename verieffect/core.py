@@ -180,6 +180,49 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def receipt_hash(receipt: Any) -> str | None:
+    """Chain hash of a stored receipt, or None if it cannot be canonicalized
+    (lone surrogate, NaN, pathological nesting). Never raises."""
+    try:
+        return sha256_hex(canonical_json(receipt))
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
+def parse_chain_line(raw: bytes) -> dict | None:
+    """Strictly parse one chain line: strict UTF-8, strict JSON, must be an
+    object, must be canonicalizable. Returns None on any failure; never raises."""
+    try:
+        obj = strict_loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError, TypeError):  # UnicodeDecodeError ⊂ ValueError
+        return None
+    if not isinstance(obj, dict) or receipt_hash(obj) is None:
+        return None
+    return obj
+
+
+def _atomic_write(path: Path, data: bytes, mode: int) -> None:
+    """Write `data` to `path` atomically: temp file created O_EXCL with the
+    final permissions from the start (no chmod-after window), fsync, then
+    os.replace. On any failure the temp file is removed and `path` is
+    untouched — a crash can never leave a half-written key."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(tmp), flags, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------- key management
 
 class Keyring:
@@ -190,44 +233,48 @@ class Keyring:
         self.priv_path = self.key_dir / "verieffect_ed25519.pem"
         self.pub_path = self.key_dir / "verieffect_ed25519.pub"
 
+    @staticmethod
+    def _pub_bytes(key: Ed25519PrivateKey) -> bytes:
+        return key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+
+    def _load_existing(self) -> Ed25519PrivateKey:
+        key = serialization.load_pem_private_key(
+            self.priv_path.read_bytes(), password=None)
+        if not isinstance(key, Ed25519PrivateKey):
+            raise TypeError("existing key is not Ed25519")
+        if not self.pub_path.exists():
+            # crash between the private and public writes: the public key is
+            # derivable, so restore it rather than failing later
+            _atomic_write(self.pub_path, self._pub_bytes(key), 0o644)
+        return key
+
     def load_or_create(self) -> Ed25519PrivateKey:
         if self.priv_path.exists():
-            key = serialization.load_pem_private_key(
-                self.priv_path.read_bytes(), password=None)
-            if not isinstance(key, Ed25519PrivateKey):
-                raise TypeError("existing key is not Ed25519")
-            return key
+            return self._load_existing()
         # lock around generate+write so two concurrent first-claims can't each
         # generate a key and overwrite the other's (TOCTOU)
         self.key_dir.mkdir(parents=True, exist_ok=True)
         with _file_lock(self.priv_path):
             if self.priv_path.exists():  # re-check under lock
-                key = serialization.load_pem_private_key(
-                    self.priv_path.read_bytes(), password=None)
-                if not isinstance(key, Ed25519PrivateKey):
-                    raise TypeError("existing key is not Ed25519")
-                return key
+                return self._load_existing()
             key = Ed25519PrivateKey.generate()
             priv_pem = key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption(),
             )
-            # Best-effort permission tightening. POSIX: chmod 0600 (real).
-            # Windows: os.chmod only toggles the read-only bit — it does NOT
-            # restrict other local users. For real isolation on Windows, run the
-            # verifier as a separate OS user or use an encrypted key (roadmap).
-            self.priv_path.write_bytes(priv_pem)
-            try:
-                os.chmod(self.priv_path, 0o600)
-            except OSError:
-                pass
-            self.pub_path.write_bytes(
-                key.public_key().public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-            )
+            # Atomic: temp file created O_CREAT|O_EXCL with mode 0600 from the
+            # start, fsynced, then os.replace()d into place — no partially
+            # written key and no world-readable window.
+            # POSIX: 0600 is real. Windows: the mode only toggles the
+            # read-only bit — it does NOT restrict other local users. For real
+            # isolation on Windows, run the verifier as a separate OS user or
+            # use an encrypted key (roadmap).
+            _atomic_write(self.priv_path, priv_pem, 0o600)
+            _atomic_write(self.pub_path, self._pub_bytes(key), 0o644)
             return key
 
     def public_key_pem(self) -> str:
@@ -266,30 +313,117 @@ class ChainStore:
     @staticmethod
     def _legacy_belongs_to(path: Path, agent_id: str) -> bool:
         try:
-            with path.open("r", encoding="utf-8") as f:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
                 first = f.readline().strip()
-            return bool(first) and strict_loads(first).get("agent_id") == agent_id
-        except (OSError, json.JSONDecodeError, ValueError):
+            if not first:
+                return False
+            obj = strict_loads(first)
+            return isinstance(obj, dict) and obj.get("agent_id") == agent_id
+        except (OSError, ValueError, RecursionError):
             return False
 
+    @staticmethod
+    def _last_line(p: Path) -> bytes | None:
+        """Last non-blank line of a chain file as raw bytes (binary read —
+        a torn UTF-8 tail can never raise UnicodeDecodeError here)."""
+        last = None
+        with p.open("rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if raw:
+                    last = raw
+        return last
+
     def last_hash(self, agent_id: str) -> str:
+        """Chain hash of the newest receipt. A corrupt or torn last line
+        raises a structured RuntimeError pointing at `verieffect repair` —
+        never a raw UnicodeDecodeError/RecursionError, and we never silently
+        chain onto a line we cannot parse."""
         p = self._path(agent_id)
         if not p.exists():
             return GENESIS_HASH
-        last = None
-        with p.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    last = line
+        last = self._last_line(p)
         if last is None:
             return GENESIS_HASH
+        why = None
         try:
-            return sha256_hex(canonical_json(strict_loads(last)))
-        except (json.JSONDecodeError, ValueError) as e:
-            raise RuntimeError(
-                f"last line of {p.name} is corrupt ({e}) — repair or remove it "
-                "before issuing new claims for this agent") from e
+            obj = strict_loads(last.decode("utf-8"))  # strict decode
+            if not isinstance(obj, dict):
+                why = f"not a JSON object ({type(obj).__name__})"
+            else:
+                h = receipt_hash(obj)
+                if h is not None:
+                    return h
+                why = "receipt cannot be canonicalized"
+        except (ValueError, RecursionError, TypeError) as e:  # incl. UnicodeDecodeError
+            why = f"{type(e).__name__}: {str(e)[:200]}"
+        raise RuntimeError(
+            f"last line of {p.name} is corrupt or torn ({why}) — run "
+            f"`verieffect repair --agent {agent_id}` to move it to a .torn "
+            "sidecar, then retry")
+
+    def repair_tail(self, agent_id: str, priv: Ed25519PrivateKey) -> dict:
+        """Recover from a torn tail (crash mid-append).
+
+        Under the agent's transaction lock: if the last non-blank line does
+        not parse, it is appended to <chain>.torn (raw bytes, fsynced), the
+        chain is truncated to just before it, and a signed `repair_note`
+        receipt (verdict UNVERIFIABLE — it attests nothing about any effect)
+        recording the torn line's size and sha256 is appended. Only the TAIL
+        is repaired: if the line before it is also corrupt, raises
+        RuntimeError (that is damage, not a torn append — audit it).
+
+        Returns {"status": "no_chain"|"empty"|"intact"|"newline_added"|"repaired", ...}.
+        """
+        p = self._path(agent_id)
+        with self.transaction(agent_id):
+            if not p.exists():
+                return {"status": "no_chain", "chain": str(p)}
+            data = p.read_bytes()
+            stripped_end = len(data.rstrip(b" \t\r\n"))
+            if stripped_end == 0:
+                return {"status": "empty", "chain": str(p)}
+            start = data.rfind(b"\n", 0, stripped_end) + 1
+            line = data[start:stripped_end].strip()
+            if parse_chain_line(line) is not None:
+                if not data.endswith(b"\n"):
+                    with p.open("ab") as f:
+                        f.write(b"\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    return {"status": "newline_added", "chain": str(p)}
+                return {"status": "intact", "chain": str(p)}
+            prefix = data[:start]
+            pend = len(prefix.rstrip(b" \t\r\n"))
+            if pend:
+                pstart = prefix.rfind(b"\n", 0, pend) + 1
+                if parse_chain_line(prefix[pstart:pend].strip()) is None:
+                    raise RuntimeError(
+                        f"{p.name}: the line before the torn tail is also "
+                        "corrupt — this is not a torn append; refusing "
+                        "automatic repair (run audit and inspect the file)")
+            sidecar = p.with_name(p.name + ".torn")
+            with sidecar.open("ab") as f:
+                f.write(line + b"\n")
+                f.flush()
+                os.fsync(f.fileno())
+            with p.open("r+b") as f:
+                f.truncate(start)
+                f.flush()
+                os.fsync(f.fileno())
+            prev = self.last_hash(agent_id)
+            body = receipt_body(
+                claim_id=str(uuid.uuid4()), agent_id=agent_id, kind="repair_note",
+                target=p.name, expect={},
+                observed={"action": "torn_tail_moved_to_sidecar",
+                          "sidecar": sidecar.name,
+                          "torn_bytes": len(line),
+                          "torn_sha256": sha256_hex(line)},
+                verdict="UNVERIFIABLE", prev_hash=prev)
+            receipt = sign_receipt(body, priv)
+            self.append(receipt)
+            return {"status": "repaired", "chain": str(p), "sidecar": str(sidecar),
+                    "torn_bytes": len(line), "receipt": receipt}
 
     def transaction(self, agent_id: str):
         """Context manager locking the read-modify-write cycle for one agent.
@@ -305,6 +439,17 @@ class ChainStore:
         p = self._path(receipt["agent_id"])
         line = json.dumps(receipt, sort_keys=True, ensure_ascii=False) + "\n"
         with _file_lock(p):
+            # if a previous write was torn before its newline, never glue
+            # this receipt onto it — start a fresh line
+            try:
+                with p.open("rb") as rf:
+                    rf.seek(0, os.SEEK_END)
+                    if rf.tell() > 0:
+                        rf.seek(-1, os.SEEK_END)
+                        if rf.read(1) != b"\n":
+                            line = "\n" + line
+            except FileNotFoundError:
+                pass
             with p.open("a", encoding="utf-8") as f:
                 f.write(line)
                 f.flush()
@@ -326,7 +471,7 @@ class ChainStore:
                     continue
                 try:
                     out.append(strict_loads(line))
-                except (json.JSONDecodeError, ValueError) as e:
+                except (ValueError, RecursionError) as e:
                     raise RuntimeError(
                         f"corrupt line {lineno} of {p.name}: {e} — repair or "
                         "remove it before auditing this agent") from e
@@ -374,58 +519,62 @@ def _file_lock(path: Path, timeout_s: float = LOCK_TIMEOUT_S):
     tkey = (threading.get_ident(), key)
     lk = _lock_for(key)
     lk.acquire()
-    if _depth.get(tkey, 0) > 0:
-        # same thread re-entering: bump depth, skip OS-level lock (we own it)
-        _depth[tkey] += 1
+    try:
+        if _depth.get(tkey, 0) > 0:
+            # same thread re-entering: bump depth, skip OS-level lock (we own it)
+            _depth[tkey] += 1
+            try:
+                yield
+            finally:
+                _depth[tkey] -= 1
+            return
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        # open BEFORE recording depth: if open() fails (PermissionError, ...)
+        # there is nothing to roll back, and a stale depth=1 can never make a
+        # later acquisition skip the OS lock (finding M6)
+        fh = open(lock_path, "a+")
+        _depth[tkey] = 1
+        os_locked = False
         try:
+            if sys.platform != "win32":
+                fcntl = __import__("fcntl")
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                os_locked = True
+            else:
+                import msvcrt
+                deadline = _time.monotonic() + timeout_s
+                fh.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        os_locked = True
+                        break
+                    except OSError:
+                        if _time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"could not acquire chain lock {lock_path.name} "
+                                f"within {timeout_s:.0f}s — another process is "
+                                "holding it. Refusing to proceed unlocked.")
+                        _time.sleep(0.05)
             yield
         finally:
-            _depth[tkey] -= 1
-            lk.release()
-        return
-    _depth[tkey] = 1
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    fh = open(lock_path, "a+")
-    os_locked = False
-    try:
-        if sys.platform != "win32":
-            fcntl = __import__("fcntl")
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            os_locked = True
-        else:
-            import msvcrt
-            deadline = _time.monotonic() + timeout_s
-            fh.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    os_locked = True
-                    break
-                except OSError:
-                    if _time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"could not acquire chain lock {lock_path.name} "
-                            f"within {timeout_s:.0f}s — another process is "
-                            "holding it. Refusing to proceed unlocked.")
-                    _time.sleep(0.05)
-        yield
+            _depth.pop(tkey, None)
+            if os_locked:
+                if sys.platform != "win32":
+                    try:
+                        fcntl = __import__("fcntl")
+                        fcntl.flock(fh, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+            fh.close()
     finally:
-        _depth[tkey] -= 1
-        if os_locked:
-            if sys.platform != "win32":
-                try:
-                    fcntl = __import__("fcntl")
-                    fcntl.flock(fh, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            else:
-                try:
-                    import msvcrt
-                    fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                except OSError:
-                    pass
-        fh.close()
         lk.release()
 
 
@@ -538,12 +687,15 @@ def verify_chain(receipts: list[dict], pub_pem: str | bytes,
             prev_checked_at = ts
         try:
             prev = sha256_hex(canonical_json(r))
-        except (ValueError, TypeError) as e:
-            # non-canonicalizable receipt (e.g. NaN from a json literal):
+        except (ValueError, TypeError, RecursionError) as e:
+            # non-canonicalizable receipt (NaN, lone surrogate, deep nesting):
             # already flagged by verify_receipt; keep the walk alive with a
             # fallback hash so following chain links are still compared
             problems.append(f"[{i}] {r.get('claim_id','?')}: non-canonicalizable "
-                            f"receipt ({e})")
-            prev = sha256_hex(json.dumps(r, sort_keys=True,
-                                         ensure_ascii=False).encode("utf-8", "replace"))
+                            f"receipt ({type(e).__name__})")
+            try:
+                prev = sha256_hex(json.dumps(r, sort_keys=True, ensure_ascii=False)
+                                  .encode("utf-8", "replace"))
+            except (ValueError, TypeError, RecursionError):
+                prev = "unhashable"  # next link then breaks naturally
     return problems
