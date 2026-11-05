@@ -5,7 +5,7 @@ Show HN: Verieffect – Did the agent's action actually land? Deterministic chec
 
 **Body:**
 
-I run a 24/7 multi-agent paper-trading pipeline. The whole thing hinges on one question: when an agent says "the trade filled" or "the backup ran," is that *true*? The evidence says often not — an analysis of the public τ-bench retail benchmark (Veridatum) found ~26% of simulated agent tasks disagreed with the database on final state, and OverclaimBench found ~80% of incomplete runs are misleadingly reported.
+I run a 24/7 multi-agent paper-trading pipeline. The whole thing hinges on one question: when an agent says "the trade filled" or "the backup ran," is that *true*? The evidence says: don't assume it. In Veridatum's analysis of the public τ-bench retail benchmark, 118 of 456 simulated GPT-4.1 runs (26%) failed the final-state check — a synthetic benchmark, not a real-world error rate, but it shows why an agent's transcript isn't enough. And OverclaimBench found ~80% of incomplete runs are misleadingly reported.
 
 So I built Verieffect:
 

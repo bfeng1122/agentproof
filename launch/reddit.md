@@ -3,14 +3,14 @@
 **Title options:**
 
 1. `My agent said "backup completed" — the backup never ran. So I built signed receipts for agent work.`
-2. `I run a 24/7 AI trading pipeline. It caught me: 26% of agent tasks falsely claim success.`
+2. `I run a 24/7 AI trading pipeline. My own agent claimed a backup that never ran — so I built signed receipts.`
 3. `Built Verieffect: verify the effect, not the claim — deterministic checks + signed receipts for AI agent work.`
 
 **Body:**
 
 I run a multi-agent AI trading pipeline 24/7 (paper trading — scout, analyst, risk gate, executor, bookkeeper). The whole thing hinges on one thing: when an agent says "the trade filled" or "the backup ran," is that *true*?
 
-The evidence says: not always. An analysis of the public τ-bench retail benchmark (Veridatum) found ~26% of simulated agent tasks disagreed with the database on final state — the log said done, the record said otherwise. The research literature agrees: in OverclaimBench (arXiv:2609.20812), ~80% of incomplete runs are misleadingly reported, and "The Completion Illusion" found agents self-reporting 100% completion while verified accuracy was 86–96%.
+The evidence says: not always. In Veridatum's analysis of the public τ-bench retail benchmark, 118 of 456 simulated GPT-4.1 runs (26%) failed the final-state check — the agent's transcript and the database disagreed. It's a synthetic benchmark, not a real-world error rate, but it shows why an agent's transcript isn't enough. The research literature agrees: in OverclaimBench (arXiv:2609.20812), ~80% of incomplete runs are misleadingly reported, and "The Completion Illusion" found agents self-reporting 100% completion while verified accuracy was 86–96%.
 
 I hit this in my own setup on day one. My bookkeeper filed a claim about a backup path that didn't exist. Nothing broke because I caught it — but if I hadn't been checking, I'd have been trusting receipts for a backup that never ran.
 
@@ -42,7 +42,7 @@ It's been in production for two weeks: 40+ receipts across trade fills and backu
 
 # Posting notes (delete before posting)
 
-- r/LocalLLaMA: the "26% of agents lie" stat + trading-pipeline dogfood angle plays well here. Post first.
+- r/LocalLLaMA: the τ-bench final-state stat (attributed precisely to Veridatum's synthetic-benchmark analysis) + trading-pipeline dogfood angle plays well here. Post first.
 - r/ClaudeAI: lead with the "my agent lied about a backup" hook. Post 2–3 days later.
 - Check subreddit self-promotion rules; both are generally fine for OSS with substance.
 - Best time: weekday 7–10 AM Pacific.

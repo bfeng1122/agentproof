@@ -64,12 +64,14 @@ The signed `FAIL` receipt is the evidence, and exit code `1` lets cron alert on 
 Two things are true at once: agent tasks get done wrong surprisingly often, and agents
 tend to report them as done anyway.
 
-**Tasks silently done wrong.** An analysis by [Veridatum](https://veridatum.io/) of the
-public τ-bench retail benchmark found **26% of simulated agent tasks ended with the
-database in the wrong final state** (456 GPT-4.1 retail simulations; 118 failed the
-final-state check). That number measures wrong outcomes, not false reports — but
-nothing in the agent's own transcript tells you which 26% they were. You find out
-only by checking the system of record.
+**Tasks silently done wrong.** An analysis by [Veridatum](https://veridatum.io/) — a
+similar project we compare against below — of the public τ-bench retail benchmark found
+that **118 of 456 simulated GPT-4.1 runs (26%) failed the final-state check**: the
+agent's transcript and the database disagreed. Veridatum is explicit that this is a
+public-benchmark demonstration, not a real-world error rate, and it measures wrong
+outcomes rather than false reports. Our own inference (not Veridatum's claim): nothing
+in the agent's transcript tells you *which* runs were wrong — you find out only by
+checking the system of record.
 
 **Agents report failures as success.** The overclaiming evidence comes from the
 research literature:
