@@ -21,7 +21,7 @@ https://github.com/bfeng1122/verieffect
 
 On day one of dogfooding it caught my own agent filing a claim about a backup path that didn't exist. It's now been running against my pipeline for two weeks: 40+ receipts across fills and backup checks, and a deliberate tamper test that breaks the chain exactly as designed. (Amusingly, before launch I had AI agents red-team the repo in multiple rounds — the security reviewer reproduced a chain-relabeling attack, and a later fuzz round caught the chain lock silently self-disabling under contention on Windows. All fixed and regression-tested. The tool's whole thesis, applied to itself.)
 
-MIT licensed. ~1,300 lines of Python (+~500 of tests), deps only `cryptography` + `requests`. 91 tests + CI (ubuntu/windows × py3.10–3.12). I'm looking for harsh feedback on the receipt schema (docs/receipt-schema.md) and on which probes people actually need: S3 object exists? Docker container running? Git commit pushed? Postgres row?
+MIT licensed. ~1,300 lines of Python (+~500 of tests), deps only `cryptography` + `requests`. 118 tests + CI (ubuntu/windows × py3.10–3.12). I'm looking for harsh feedback on the receipt schema (docs/receipt-schema.md) and on which probes people actually need: S3 object exists? Docker container running? Git commit pushed? Postgres row?
 
 ---
 

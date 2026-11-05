@@ -26,7 +26,7 @@ from pathlib import Path
 
 from .core import (
     ChainStore, Keyring, receipt_body, schema_errors, sign_receipt,
-    verify_chain, verify_receipt,
+    strict_loads, verify_chain, verify_receipt,
 )
 from .probes import PROBES
 
@@ -106,7 +106,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     try:
-        receipt = json.load(args.receipt)
+        receipt = strict_loads(args.receipt.read())
     except (json.JSONDecodeError, ValueError) as e:
         print(f"INVALID: cannot parse receipt JSON: {e}", file=sys.stderr)
         return 2

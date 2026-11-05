@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "cryptography>=50.0.2",
+    "cryptography>=41.0",
     "requests>=2.34.2",
 ]
 

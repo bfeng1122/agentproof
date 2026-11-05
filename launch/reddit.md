@@ -36,7 +36,7 @@ https://github.com/bfeng1122/verieffect
 
 It's been in production for two weeks: 40+ receipts across trade fills and backup checks, plus a deliberate tamper test that breaks the chain exactly as designed. Before launch I also had AI agents red-team the repo in multiple rounds — one reproduced a chain-relabeling attack, another caught the chain lock silently giving up under contention on Windows; both fixed and regression-tested. The tool's whole thesis, applied to itself.
 
-~1,300 lines of Python (+~500 of tests), 91 tests, CI on ubuntu+windows, MIT licensed. The receipt schema is documented and I'd genuinely like feedback on it — and on what claim kinds people actually need (S3 object exists? Docker container running? Git commit pushed?).
+~1,300 lines of Python (+~500 of tests), 118 tests, CI on ubuntu+windows, MIT licensed. The receipt schema is documented and I'd genuinely like feedback on it — and on what claim kinds people actually need (S3 object exists? Docker container running? Git commit pushed?).
 
 ---
 

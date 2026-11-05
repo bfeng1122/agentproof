@@ -8,22 +8,34 @@ receipts as the evidence format.*
 When an agent says "I uploaded the file" / "the trade filled" / "the backup ran" —
 Verieffect probes ground truth *itself* and issues a receipt anyone can verify offline.
 
+```console
+$ # the backup agent's log says: "nightly backup ran ✓"
+$ verieffect claim file_exists --agent backup-cron \
+    --target ./backups/nightly.dump --expect '{"min_bytes": 1048576}' --out receipt.json
+{
+  "v": 1,
+  "claim_id": "830c4620-deb4-4d5e-a4d2-ed83c77f79da",
+  "agent_id": "backup-cron",
+  "kind": "file_exists",
+  "target": "./backups/nightly.dump",
+  "expect": { "min_bytes": 1048576 },
+  "observed": { "path": "backups\\nightly.dump", "exists": true, "size": 2, "mtime": 1793862129 },
+  "verdict": "FAIL",
+  ...
+  "sig": "ed25519:8bfac27e…"
+}
+$ echo $?
+1
+$ python verify_receipt.py --pubkey data/keys/verieffect_ed25519.pub receipt.json
+VALID: ok (claim 830c4620-deb4-4d5e-a4d2-ed83c77f79da, verdict FAIL)
+```
+
+The file exists — it's just 2 bytes. "Backup ran" was true; "backup landed" wasn't.
+The signed `FAIL` receipt is the evidence, and exit code `1` lets cron alert on it.
+
 > **Renamed from AgentProof** (2026-10-30) after finding 5+ existing products on that
 > name. Same project and repo history; the signing key is unchanged, so pre-rename
 > receipts still verify.
-
-| | Verieffect | Treeship | Attestroot | Logsiegel | Veridatum |
-|---|---|---|---|---|---|
-| Re-checks system of record at verify time | **Yes (probes)** | No — wraps/records | No — seals transcripts | No — chains logs | Yes |
-| Signed receipts + hash chain | Yes | Yes | Yes (Merkle + transparency log) | Yes | Ledger, not crypto-first |
-| Offline verification | Yes | Yes | Yes | Yes | No (SaaS) |
-| Deployment | Local CLI/library | Local CLI + hub | Local + countersign service | Local OSS | Hosted SaaS |
-| Scope | Technical claims (files/HTTP/DB/exit) | Agent sessions | Agent transcripts | Action trails | Business outcomes (Stripe, orders) |
-| License | MIT | Apache-2.0 | pre-release | Apache-2.0 | Proprietary |
-
-The one-column summary: **everyone else proves what the agent *recorded doing*; we
-check whether the effect *actually landed*.** A lying agent can poison a recording.
-It cannot poison a probe it doesn't run.
 
 > **What the signature does and doesn't prove.** The signing key lives next to your
 > agents (same host, MVP). Receipts are therefore **tamper-evident against drift and
@@ -45,14 +57,31 @@ It cannot poison a probe it doesn't run.
 
 ## Why
 
-An analysis by [Veridatum](https://veridatum.io/) of the public τ-bench retail
-benchmark found **26% of simulated agent tasks disagreed with the database on final
-state** (456 GPT-4.1 retail simulations; 118 failed the final-state check). The
-research literature agrees: agents self-report perfect completion while verified
-accuracy is 86–96% ("The Completion Illusion"), and ~80% of incomplete runs are
-misleadingly reported (OverclaimBench, arXiv:2609.20812). Autonomous agent stacks —
-cron-driven pipelines, CI bots, personal agents — fail the same way: the log says
-"done," the side effect never happened. Verieffect makes "done" a verifiable claim.
+Two things are true at once: agent tasks get done wrong surprisingly often, and agents
+tend to report them as done anyway.
+
+**Tasks silently done wrong.** An analysis by [Veridatum](https://veridatum.io/) of the
+public τ-bench retail benchmark found **26% of simulated agent tasks ended with the
+database in the wrong final state** (456 GPT-4.1 retail simulations; 118 failed the
+final-state check). That number measures wrong outcomes, not false reports — but
+nothing in the agent's own transcript tells you which 26% they were. You find out
+only by checking the system of record.
+
+**Agents report failures as success.** The overclaiming evidence comes from the
+research literature:
+
+- **LIMBO** ("Where Does Exactly-Once Live?", arXiv:2609.29095): in **90% of episodes
+  that produced a duplicate side effect, the agent reported the task as completed.**
+  This is the closest published evidence to exactly what Verieffect catches — the
+  self-report says "done," the system of record says otherwise.
+- **OverclaimBench** (arXiv:2609.20812): **80.4% of incomplete runs** were reported in
+  a misleading way.
+- **"The Completion Illusion"** (IOV Labs; a lab study, not peer-reviewed): agents
+  self-reported perfect completion while verified accuracy was 86–96%.
+
+Autonomous agent stacks — cron-driven pipelines, CI bots, personal agents — fail the
+same way: the log says "done," the side effect never happened (or happened twice).
+Verieffect makes "done" a verifiable claim.
 
 ## Related work (read this before assuming we invented it)
 
@@ -66,8 +95,8 @@ described the idea or solved adjacent problems:
   file, check the process return code — with a total checker that yields
   "Unverifiable" on malformed input rather than raising. Same core principle and
   several of the same rules as our `file_exists`/`exit_code` probes. It's a short
-  conceptual note; Verieffect is a shipped, tested implementation (91 tests, CI,
-  production use) and adds the packaging that note names as its own gap: sealed
+  conceptual note; Verieffect is a shipped, tested implementation (118 tests, CI,
+  dogfooded) and adds the packaging that note names as its own gap: sealed
   receipts re-verifiable offline.
 - **[Beyond Approved Actions: Runtime Validation of Persistent Outcomes in Agent Workflows](https://arxiv.org/abs/2609.31301)**
   (EffectMatch, Sept 2026). Broader than us: binds an application-approved outcome
@@ -98,21 +127,23 @@ cron/CI. Implementation and developer experience — not the underlying idea.
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -r requirements.txt   # Linux/macOS: .venv/bin/python
-# Optional: `pip install .` also gives you an `verieffect` console script.
+.venv/bin/python -m pip install -r requirements.txt   # Windows: .venv/Scripts/python
+# Optional: `pip install .` also gives you a `verieffect` console script.
 
 # 1. File a claim — targets a file that ships with the repo, so this PASSES on a
 #    fresh clone (exit code 0). Keys/receipts land under ./data (see below).
-.venv/Scripts/python -m verieffect.cli claim file_exists --agent my-agent \
+.venv/bin/python -m verieffect.cli claim file_exists --agent my-agent \
   --target ./README.md --expect '{"min_bytes": 1024}' --out receipt.json
 
 # 2. Verify the receipt offline (completes the claim→verify loop)
-.venv/Scripts/python verify_receipt.py \
+.venv/bin/python verify_receipt.py \
   --pubkey data/keys/verieffect_ed25519.pub receipt.json
 
 # 3. Audit the whole chain for that agent
-.venv/Scripts/python -m verieffect.cli audit --agent my-agent
+.venv/bin/python -m verieffect.cli audit --agent my-agent
 ```
+
+On Windows, substitute `.venv/Scripts/python` for `.venv/bin/python` throughout.
 
 > **Windows cmd/PowerShell:** single-quoted JSON doesn't work — use double quotes
 > with escaped inner quotes: `--expect "{\"min_bytes\": 1024}"`, and replace `\`
@@ -136,8 +167,21 @@ Output (truncated):
 }
 ```
 
-Exit codes: `0` = PASS, `1` = FAIL/UNVERIFIABLE, `2` = usage error — so shell scripts
-and cron jobs can branch on verification results directly.
+Exit codes — `claim` (`python -m verieffect.cli claim …`): `0` = PASS,
+`1` = FAIL/UNVERIFIABLE, `2` = usage error — so shell scripts and cron jobs can
+branch on verification results directly.
+
+Exit codes — offline verifier (`verify_receipt.py`) has two modes:
+
+- **Default (authenticity only):** `0` = every receipt is authentically signed,
+  schema-valid and (in `--chain` mode) correctly chained. This says nothing about
+  the verdict — a validly signed **FAIL** receipt exits `0`, because the receipt
+  itself is genuine evidence. `1` = invalid/malformed/tampered.
+- **`--require-verdict PASS|FAIL|UNVERIFIABLE`:** additionally exits `1` unless
+  the verified verdict equals the required one (in `--chain` mode: unless *every*
+  receipt's verdict matches). Use `--require-verdict PASS` when the exit code
+  should mean "authentic AND passed". Chain mode always prints a summary line such
+  as `verdicts: 12 PASS, 1 FAIL, 0 UNVERIFIABLE`.
 
 ### Where things live
 
@@ -145,6 +189,23 @@ and cron jobs can branch on verification results directly.
   claim. The `.pem` (private) never leaves your machine and is gitignored.
 - `data/chains/chain_<agent>_<hash8>.jsonl` — append-only receipt chain per agent.
 - Override the root with `VERIEFFECT_HOME=/some/path`.
+
+## How it compares
+
+| | Verieffect | Treeship | Attestroot | Logsiegel | Veridatum |
+|---|---|---|---|---|---|
+| Re-checks system of record at verify time | **Yes (probes)** | No — wraps/records | No — seals transcripts | No — chains logs | Yes |
+| Signed receipts + hash chain | Yes | Yes | Yes (Merkle + transparency log) | Yes | Ledger, not crypto-first |
+| Offline verification | Yes | Yes | Yes | Yes | No (SaaS) |
+| Deployment | Local CLI/library | Local CLI + hub | Local + countersign service | Local OSS | Hosted SaaS |
+| Scope | Technical claims (files/HTTP/DB/exit) | Agent sessions | Agent transcripts | Action trails | Business outcomes (Stripe, orders) |
+| License | MIT | Apache-2.0 | pre-release | Apache-2.0 | Proprietary |
+
+The one-column summary: **the receipt tools above prove what the agent *recorded
+doing*; Verieffect checks whether the effect *actually landed*.** A lying agent can
+poison a recording. It cannot poison a probe it doesn't run. (Veridatum also checks
+the system of record, as hosted SaaS for business outcomes — see
+[Related work](#related-work-read-this-before-assuming-we-invented-it).)
 
 ## How it fits together
 
@@ -232,8 +293,8 @@ response).
 
 ## Threat model in one paragraph
 
-Verieffect catches **sloppy** agents, not **adversarial** ones: the 26% failure mode
-where a model's report drifts from reality. The signing key lives on the operator's
+Verieffect catches **sloppy** agents, not **adversarial** ones: tasks that were done
+wrong, and agents whose "done" report doesn't match what actually landed. The signing key lives on the operator's
 machine, so an attacker with local code execution as the same user can forge
 receipts — no same-host scheme survives that. If your threat is a truly adversarial
 agent, run the verifier as a separate OS user/host (roadmap: hosted verifier).
@@ -241,10 +302,11 @@ Full details in [receipt-schema.md](docs/receipt-schema.md).
 
 ## Status
 
-MVP (Alpha). 91-test suite (`python tests/test_all.py` with the venv python; CI runs
-ubuntu+windows × Python 3.10–3.12), in daily production use verifying a 24/7
-paper-trading agent stack (fills, portfolio state, backups) since Oct 2026 — 40+
-receipts and a deliberate tamper test that breaks the chain as designed.
+MVP (Alpha). 118-test suite (`python tests/test_all.py` with the venv python; CI runs
+ubuntu+windows × Python 3.10–3.12). Dogfooded for ~2 weeks (since late Oct 2026)
+on the author's own paper-trading agent stack (fills, portfolio state, backups) —
+40+ receipts so far, plus a deliberate tamper test that breaks the chain as designed.
+Not yet battle-tested by anyone else.
 Roadmap: hosted verifier API, `kid` key rotation, `claimed_at`/`checked_at` split,
 connector library (Stripe/broker/Postgres), MCP server.
 

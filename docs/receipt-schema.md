@@ -22,10 +22,29 @@ spec; `verify_receipt.py` in the repository root is the reference verifier.
 
 ## Canonical JSON (what gets signed / hashed)
 
-- `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)` encoded UTF-8.
+- Canonical form is exactly Python's
+  `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)`,
+  encoded UTF-8.
+- This is **NOT RFC 8785 (JCS)**. The two differ in at least: float serialization
+  (Python `repr` vs. the ECMAScript number-to-string algorithm, e.g. `1e21`,
+  `1.0`), and key ordering for non-BMP characters (Python sorts by code point; JCS
+  sorts by UTF-16 code units). A non-Python verifier must reproduce Python's
+  output, not a JCS library's.
+- **Recommendation:** keep floats out of `expect` and `observed` (use integers,
+  strings, or decimal strings). Integer-, string-, bool- and null-only receipts
+  canonicalize identically across implementations; floats are where they diverge.
 - Applies to the receipt **without** the `sig` field when signing.
 - Chain hash = SHA-256 hex digest of the canonical JSON of the **full stored receipt
   including `sig`**.
+- Parsing: verifiers MUST reject receipts with duplicate object keys (plain
+  `json.loads` keeps the last one, other parsers keep the first — a duplicate
+  lets two consumers read different receipts from the same bytes) and the
+  non-standard `NaN`/`Infinity` literals. `v` MUST be the JSON integer `1`
+  (not `true`, not `1.0`).
+- **Planned for v2:** a domain-separation prefix on the signed bytes (e.g. a
+  fixed `verieffect-receipt-v2\n` context string prepended before signing), so a
+  receipt signature can never be replayed as a signature over some other message
+  type made with the same key. v1 signs the bare canonical JSON.
 
 ## Verification procedure
 
@@ -53,8 +72,9 @@ Single receipt:
 Chain (audit):
 1. Start with `prev = "0"*64`.
 2. For each receipt in chain order: verify signature; assert
-   `prev_receipt_hash == prev`; when an expected `agent_id` is supplied, assert
-   every receipt's `agent_id` matches (chains are bound to one agent);
+   `prev_receipt_hash == prev`; assert every receipt's `agent_id` matches the
+   expected agent (chains are bound to one agent — `verify_receipt.py` uses
+   `--agent` when given, otherwise the first receipt's `agent_id`);
    flag any `checked_at` that regresses vs the previous receipt (backdating
    guard — catches *sloppy* regeneration, not a careful forger);
    then `prev = sha256(canonical(receipt))`.

@@ -52,10 +52,13 @@ def schema_errors(receipt: Any) -> list[str]:
     errs: list[str] = []
     if not isinstance(receipt, dict):
         return ["receipt is not a JSON object"]
-    if receipt.get("v") != SCHEMA_VERSION:
+    v = receipt.get("v")
+    # type check: True == 1 and 1.0 == 1 in Python
+    if type(v) is not int or v != SCHEMA_VERSION:
         errs.append(f"v must be {SCHEMA_VERSION}")
     cid = receipt.get("claim_id")
-    if not isinstance(cid, str) or not _UUID_RE.match(cid):
+    # fullmatch, not match: '$' also matches before a trailing newline
+    if not isinstance(cid, str) or not _UUID_RE.fullmatch(cid):
         errs.append("claim_id must be a lowercase uuid4 string")
     if not isinstance(receipt.get("agent_id"), str) or not receipt.get("agent_id"):
         errs.append("agent_id must be a non-empty string")
@@ -70,16 +73,38 @@ def schema_errors(receipt: Any) -> list[str]:
     if receipt.get("verdict") not in VALID_VERDICTS:
         errs.append(f"verdict must be one of {VALID_VERDICTS}")
     ts = receipt.get("checked_at")
-    if not isinstance(ts, str) or not _TS_RE.match(ts):
+    if not isinstance(ts, str) or not _TS_RE.fullmatch(ts):
         errs.append("checked_at must be ISO8601 UTC (YYYY-MM-DDTHH:MM:SSZ)")
     prh = receipt.get("prev_receipt_hash")
-    if not isinstance(prh, str) or not _HEX64_RE.match(prh):
+    if not isinstance(prh, str) or not _HEX64_RE.fullmatch(prh):
         errs.append("prev_receipt_hash must be 64 lowercase hex chars")
     sig = receipt.get("sig")
     if not isinstance(sig, str) or not sig.startswith("ed25519:") \
-            or not _HEX128_RE.match(sig[len("ed25519:"):]):
+            or not _HEX128_RE.fullmatch(sig[len("ed25519:"):]):
         errs.append("sig must be 'ed25519:' + 128 lowercase hex chars")
     return errs
+
+
+def _reject_duplicate_keys(pairs):
+    # plain json.loads keeps the LAST duplicate; a first-key-wins consumer
+    # would then read a different receipt than the one we verified
+    obj = {}
+    for k, v in pairs:
+        if k in obj:
+            raise ValueError(f"duplicate JSON key {k!r}")
+        obj[k] = v
+    return obj
+
+
+def _reject_constant(name):
+    raise ValueError(f"non-finite JSON constant not allowed: {name}")
+
+
+def strict_loads(text: str) -> Any:
+    """json.loads that rejects duplicate keys and NaN/Infinity (ValueError).
+    Mirrors verify_receipt.strict_loads — used for every receipt/chain read."""
+    return json.loads(text, object_pairs_hook=_reject_duplicate_keys,
+                      parse_constant=_reject_constant)
 
 
 # ---------------------------------------------------------------- canonical json
@@ -186,7 +211,7 @@ class ChainStore:
         try:
             with path.open("r", encoding="utf-8") as f:
                 first = f.readline().strip()
-            return bool(first) and json.loads(first).get("agent_id") == agent_id
+            return bool(first) and strict_loads(first).get("agent_id") == agent_id
         except (OSError, json.JSONDecodeError, ValueError):
             return False
 
@@ -203,7 +228,7 @@ class ChainStore:
         if last is None:
             return GENESIS_HASH
         try:
-            return sha256_hex(canonical_json(json.loads(last)))
+            return sha256_hex(canonical_json(strict_loads(last)))
         except (json.JSONDecodeError, ValueError) as e:
             raise RuntimeError(
                 f"last line of {p.name} is corrupt ({e}) — repair or remove it "
@@ -243,7 +268,7 @@ class ChainStore:
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
+                    out.append(strict_loads(line))
                 except (json.JSONDecodeError, ValueError) as e:
                     raise RuntimeError(
                         f"corrupt line {lineno} of {p.name}: {e} — repair or "
@@ -382,8 +407,9 @@ def verify_receipt(receipt: dict, pub_pem: str | bytes) -> tuple[bool, str]:
     """
     if not isinstance(receipt, dict) or "sig" not in receipt:
         return False, "missing signature"
-    if receipt.get("v") != SCHEMA_VERSION:
-        return False, f"unsupported schema version {receipt.get('v')!r}"
+    v = receipt.get("v")
+    if type(v) is not int or v != SCHEMA_VERSION:
+        return False, f"unsupported schema version {v!r}"
     sig_field = receipt.get("sig")
     if not isinstance(sig_field, str) or not sig_field.startswith("ed25519:"):
         return False, "unsupported signature scheme"
@@ -392,10 +418,10 @@ def verify_receipt(receipt: dict, pub_pem: str | bytes) -> tuple[bool, str]:
         # spec mandates lowercase hex — canonical form keeps chain-head
         # hashes unambiguous across encodings of the same receipt
         return False, "signature hex must be lowercase (canonical form)"
-    try:
-        sig = bytes.fromhex(hex_part)
-    except ValueError:
+    # exact shape BEFORE bytes.fromhex, which tolerates whitespace
+    if not _HEX128_RE.fullmatch(hex_part):
         return False, "malformed signature encoding"
+    sig = bytes.fromhex(hex_part)
     # work on a shallow copy — never mutate (even transiently) the caller's dict
     body = {k: v for k, v in receipt.items() if k != "sig"}
     try:

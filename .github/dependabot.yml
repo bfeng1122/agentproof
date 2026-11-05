@@ -4,6 +4,13 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # The standalone verifier only needs Ed25519; keep the floor low so
+      # `pip install cryptography` works on older systems. Dependabot must not
+      # raise the minimum version (it did once: 41.0 -> 50.0.2). Security
+      # advisories still surface via Dependabot alerts.
+      - dependency-name: "cryptography"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

@@ -532,6 +532,226 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli audit missing pubkey: exit 2, no traceback",
           cp16.returncode == 2 and "Traceback" not in cp16.stderr)
 
+    print("== standalone verifier hardening ==")
+    import verify_receipt as vr
+    from cryptography.hazmat.primitives import serialization as _ser
+    from verieffect.core import schema_errors as core_schema_errors
+    from verieffect.core import strict_loads as core_strict_loads
+    cli_keys = tmp / "cli_home" / "keys"
+    cli_pub_path = str(cli_keys / "verieffect_ed25519.pub")
+    cli_priv = Keyring(cli_keys).load_or_create()
+    cli_pub_obj = _ser.load_pem_public_key(Path(cli_pub_path).read_bytes())
+    hd = tmp / "hardening"
+    hd.mkdir()
+
+    def run_vr(*argv):
+        return subprocess.run(
+            [PY, str(ROOT / "verify_receipt.py"), "--pubkey", cli_pub_path, *argv],
+            capture_output=True, text=True, cwd=str(ROOT),
+            encoding="utf-8", errors="replace")
+
+    def make_chain(specs):
+        """specs: list of (agent_id, verdict) -> properly linked signed receipts"""
+        out, prev_h = [], GENESIS_HASH
+        for i, (ag, vd) in enumerate(specs):
+            bdy = receipt_body(str(uuid_mod.uuid4()), ag, "file_exists", "x", {},
+                               {"i": i}, vd, prev_h)
+            rr = sign_receipt(bdy, cli_priv)
+            out.append(rr)
+            prev_h = sha256_hex(canonical_json(rr))
+        return out
+
+    def write_lines(name, lines):
+        p = hd / name
+        p.write_bytes(b"".join(
+            (ln if isinstance(ln, bytes) else ln.encode("utf-8")) + b"\n"
+            for ln in lines))
+        return str(p)
+
+    good_line = json.dumps(rec, sort_keys=True, ensure_ascii=False)
+
+    # FIX 1a: huge int (ValueError on 3.11+) + deep nesting (RecursionError)
+    p = write_lines("crash_1a.jsonl", ['{"v": 1, "n": ' + "9" * 5000 + "}",
+                                       "[" * 200000, good_line])
+    cpa = run_vr("--chain", p)
+    check("chain: 5000-digit int + 200k-deep nesting -> malformed, no traceback",
+          "Traceback" not in cpa.stderr and cpa.returncode == 1
+          and cpa.stdout.count("malformed JSON line") == 2
+          and "3 receipts, 2 bad" in cpa.stdout)
+
+    # FIX 1b: lone surrogate breaks canonical_json AND the old fallback
+    p = write_lines("crash_1b.jsonl",
+                    ['{"v":1,"claim_id":"\\ud800","agent_id":"cli-agent"}', good_line])
+    cpb = run_vr("--chain", "--agent", "cli-agent", p)
+    check("chain: lone-surrogate receipt -> no traceback, walk continues, next link breaks",
+          "Traceback" not in cpb.stderr and cpb.returncode == 1
+          and "2 receipts, 2 bad" in cpb.stdout)
+
+    # FIX 1c: verify_one with a lone-surrogate body never raises
+    try:
+        ok_s, why_s = vr.verify_one({"v": 1, "sig": "ed25519:" + "ab" * 64,
+                                     "x": "\ud800"}, cli_pub_obj)
+        check("verify_one lone-surrogate body -> clean rejection",
+              not ok_s and "non-canonicalizable" in why_s)
+    except Exception as e:  # noqa: BLE001
+        check(f"verify_one lone-surrogate body -> clean rejection (raised {e!r})", False)
+
+    # FIX 2: --require-verdict
+    fail_rec = make_chain([("cli-agent", "FAIL")])[0]
+    fail_p = hd / "fail.json"
+    fail_p.write_text(json.dumps(fail_rec), encoding="utf-8")
+    cpf0 = run_vr(str(fail_p))
+    cpf1 = run_vr("--require-verdict", "PASS", str(fail_p))
+    cpf2 = run_vr("--require-verdict", "FAIL", str(fail_p))
+    check("signed FAIL receipt: default exit 0 (authenticity only)",
+          cpf0.returncode == 0 and "VALID" in cpf0.stdout)
+    check("signed FAIL receipt + --require-verdict PASS -> exit 1",
+          cpf1.returncode == 1 and "VERDICT MISMATCH" in cpf1.stdout)
+    check("signed FAIL receipt + --require-verdict FAIL -> exit 0", cpf2.returncode == 0)
+    rv_chain = make_chain([("rv", "PASS"), ("rv", "FAIL")])
+    p = write_lines("rv.jsonl", [json.dumps(x) for x in rv_chain])
+    cpr0 = run_vr("--chain", p)
+    cpr1 = run_vr("--chain", "--require-verdict", "PASS", p)
+    check("chain: verdict summary printed, default exit 0",
+          cpr0.returncode == 0
+          and "verdicts: 1 PASS, 1 FAIL, 0 UNVERIFIABLE" in cpr0.stdout)
+    check("chain + --require-verdict PASS with one FAIL -> exit 1",
+          cpr1.returncode == 1 and "1 receipt(s) differ" in cpr1.stdout)
+
+    # FIX 3: trailing newline / inner whitespace in hex no longer accepted
+    nl = dict(rec); nl["sig"] = rec["sig"] + "\n"
+    ok_nl, _ = vr.verify_one(nl, cli_pub_obj)
+    ok_nl_core, _ = verify_receipt(nl, Path(cli_pub_path).read_text())
+    check("sig with trailing newline rejected (standalone + core)",
+          not ok_nl and not ok_nl_core and vr.schema_errors(nl) != []
+          and core_schema_errors(nl) != [])
+    sp = dict(rec); h = rec["sig"][len("ed25519:"):]
+    sp["sig"] = "ed25519:" + h[:64] + " " + h[64:]
+    ok_sp, _ = vr.verify_one(sp, cli_pub_obj)
+    check("sig with inner space rejected (bytes.fromhex no longer reached)", not ok_sp)
+    nl_p = hd / "nl.json"
+    nl_p.write_text(json.dumps(nl), encoding="utf-8")
+    cpn = run_vr(str(nl_p))
+    check("CLI: trailing-newline sig -> INVALID exit 1",
+          cpn.returncode == 1 and "INVALID" in cpn.stdout)
+    for fld in ("claim_id", "checked_at", "prev_receipt_hash"):
+        t = dict(rec); t[fld] = rec[fld] + "\n"
+        check(f"schema: {fld} with trailing newline flagged",
+              vr.schema_errors(t) != [] and core_schema_errors(t) != [])
+
+    # FIX 4: v=True / v=1.0 (True == 1 in Python) rejected even when signed
+    for bad_v in (True, 1.0):
+        bdy = receipt_body(str(uuid_mod.uuid4()), "cli-agent", "file_exists", "x",
+                           {}, {}, "PASS", GENESIS_HASH)
+        bdy["v"] = bad_v
+        rv_ = sign_receipt(bdy, cli_priv)
+        ok_vs, _ = vr.verify_one(rv_, cli_pub_obj)
+        ok_vc, _ = verify_receipt(rv_, Path(cli_pub_path).read_text())
+        check(f"v={bad_v!r} rejected by verify_one/schema_errors (standalone + core)",
+              not ok_vs and not ok_vc and "v must be 1" in vr.schema_errors(rv_)
+              and "v must be 1" in core_schema_errors(rv_))
+
+    # FIX 5: duplicate keys / NaN rejected
+    dup_text = '{"verdict":"PASS",' + json.dumps(fail_rec)[1:]
+    check("plain json.loads would accept dup-key receipt (premise)",
+          vr.verify_one(json.loads(dup_text), cli_pub_obj)[0])
+    dup_p = hd / "dup.json"
+    dup_p.write_text(dup_text, encoding="utf-8")
+    cpd = run_vr(str(dup_p))
+    check("single-file: duplicate keys -> INVALID exit 1",
+          cpd.returncode == 1 and "duplicate JSON key" in cpd.stdout)
+    p = write_lines("dup.jsonl", [dup_text])
+    cpdc = run_vr("--chain", p)
+    check("chain: duplicate-key line reported malformed, no traceback",
+          cpdc.returncode == 1 and "malformed JSON line" in cpdc.stdout
+          and "duplicate JSON key" in cpdc.stdout and "Traceback" not in cpdc.stderr)
+    nan_p = hd / "nan.json"
+    nan_p.write_text(json.dumps(fail_rec)[:-1] + ',"z":NaN}', encoding="utf-8")
+    cpnan = run_vr(str(nan_p))
+    check("single-file: NaN literal -> INVALID parse error",
+          cpnan.returncode == 1 and "non-finite" in cpnan.stdout)
+    dup_store = ChainStore(tmp / "dup_chains")
+    dup_store.append(sign_receipt(
+        receipt_body("cD", "dupa", "file_exists", "x", {}, {}, "PASS", GENESIS_HASH), priv))
+    dpath = dup_store._path("dupa")
+    dpath.write_text(dpath.read_text(encoding="utf-8")
+                     + '{"verdict":"PASS","verdict":"FAIL"}\n', encoding="utf-8")
+    try:
+        dup_store.read_all("dupa")
+        check("core read_all rejects duplicate-key line", False)
+    except RuntimeError as e:
+        check("core read_all rejects duplicate-key line", "duplicate" in str(e))
+
+    # SHOULD-FIX: chain agent inferred from first receipt and enforced
+    mixed = make_chain([("agent-one", "PASS"), ("agent-two", "PASS")])
+    p = write_lines("mixed.jsonl", [json.dumps(x) for x in mixed])
+    cpm = run_vr("--chain", p)
+    check("chain without --agent: agent inferred from first receipt + enforced",
+          cpm.returncode == 1 and "inferred 'agent-one'" in cpm.stdout
+          and "agent_ok=False" in cpm.stdout and "2 receipts, 1 bad" in cpm.stdout)
+
+    # SHOULD-FIX: non-Ed25519 public key -> clear message
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    ec_pub = _ec.generate_private_key(_ec.SECP256R1()).public_key().public_bytes(
+        _ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo)
+    ec_path = hd / "ec.pub"
+    ec_path.write_bytes(ec_pub)
+    cpk = subprocess.run(
+        [PY, str(ROOT / "verify_receipt.py"), "--pubkey", str(ec_path),
+         str(tmp / "receipt.json")],
+        capture_output=True, text=True, cwd=str(ROOT))
+    check("non-Ed25519 pubkey -> 'INVALID: public key is not Ed25519'",
+          cpk.returncode == 1 and "public key is not Ed25519" in cpk.stdout)
+
+    # SHOULD-FIX: strict UTF-8 decoding (no silent U+FFFD replacement)
+    raw_bad = json.dumps(rec, ensure_ascii=False).encode("utf-8").replace(
+        b'"file_exists"', b'"file_exists\xff"', 1)
+    badb_p = hd / "badbytes.json"
+    badb_p.write_bytes(raw_bad)
+    cpu = run_vr(str(badb_p))
+    check("single-file: invalid UTF-8 -> INVALID parse error (strict decode)",
+          cpu.returncode == 1 and "cannot parse" in cpu.stdout
+          and "Traceback" not in cpu.stderr)
+    p = write_lines("badbytes.jsonl", [b'{"x": "\xff"}', good_line])
+    cpuc = run_vr("--chain", p)
+    check("chain: invalid-UTF-8 line reported malformed, walk continues",
+          cpuc.returncode == 1 and "UnicodeDecodeError" in cpuc.stdout
+          and "2 receipts, 1 bad" in cpuc.stdout and "Traceback" not in cpuc.stderr)
+
+    # MIRROR: standalone and core schema_errors agree on edge cases
+    edge_table = [good_signed, {}, [], "x", None]
+    for k_, v_ in [("v", True), ("v", 1.0), ("v", "1"), ("v", 2),
+                   ("claim_id", good_signed["claim_id"] + "\n"),
+                   ("claim_id", good_signed["claim_id"].upper()),
+                   ("checked_at", good_signed["checked_at"] + "\n"),
+                   ("prev_receipt_hash", GENESIS_HASH + "\n"),
+                   ("prev_receipt_hash", None),
+                   ("sig", good_signed["sig"] + "\n"),
+                   ("sig", good_signed["sig"].upper()),
+                   ("sig", 5), ("verdict", "MAYBE"), ("verdict", ["PASS"]),
+                   ("expect", []), ("agent_id", "")]:
+        e_ = dict(good_signed); e_[k_] = v_
+        edge_table.append(e_)
+    disagree = [i for i, e_ in enumerate(edge_table)
+                if len(vr.schema_errors(e_)) != len(core_schema_errors(e_))]
+    check(f"standalone vs core schema_errors agree on {len(edge_table)} edge cases "
+          f"(disagree at {disagree})", disagree == [])
+    # dup keys/NaN never reach schema_errors (dicts can't hold duplicates), so
+    # parity is at the loader: both strict_loads must reject the same inputs
+    loader_cases = ['{"a":1,"a":2}', '{"a":{"b":1,"b":1}}', '{"a":NaN}',
+                    '{"a":Infinity}', '{"a":-Infinity}']
+
+    def _rejects(fn, s):
+        try:
+            fn(s)
+            return False
+        except ValueError:
+            return True
+    check("standalone + core strict_loads both reject dup keys and NaN/Infinity",
+          all(_rejects(vr.strict_loads, s) and _rejects(core_strict_loads, s)
+              for s in loader_cases)
+          and vr.strict_loads('{"a":1}') == core_strict_loads('{"a":1}') == {"a": 1})
+
 print()
 n_pass = sum(1 for _, ok in results if ok)
 print(f"RESULT: {n_pass}/{len(results)} passed")
