@@ -7,8 +7,14 @@ Rules (non-negotiable; normative spec: docs/receipt-schema.md):
 - Every probe returns (observed: dict, verdict: str). verdict is one of
   PASS / FAIL / UNVERIFIABLE. UNVERIFIABLE means the probe could not reach
   or judge ground truth (missing dep, network error, timeout, binary not
-  found, malformed expect) — it is NOT a silent pass. FAIL is reserved for
-  a genuine mismatch between observed state and the expectation.
+  found, malformed expect, a REFUSED probe — exit_code without allow_shell,
+  http_ok with a non-GET/HEAD method — or a response/output that exceeded
+  its size cap and so was never fully observed) — it is NOT a silent pass.
+  FAIL is reserved for a genuine mismatch between observed state and the
+  expectation; a refusal or a cap is never reported as FAIL.
+- SHA-256 expectations (sha256, body_sha256, stdout_sha256) must be exactly
+  64 hex digits; case is ignored (PowerShell's Get-FileHash emits
+  uppercase). A malformed hash is UNVERIFIABLE, not FAIL.
 - `expect` is validated STRICTLY per probe: a non-object expect, an unknown
   key (e.g. the typo "min_byte"), or a wrongly typed value yields
   UNVERIFIABLE naming the offending key(s). An unrecognized key is an
@@ -56,14 +62,23 @@ _V_BOOL = ("a boolean (true/false)", lambda x: isinstance(x, bool))
 _V_DICT = ("an object", lambda x: isinstance(x, dict))
 _V_LIST = ("an array", lambda x: isinstance(x, list))
 _V_ANY = ("any value", lambda x: True)  # validated separately (timeout_s)
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+_V_SHA256 = ("a SHA-256 hex digest (exactly 64 hex digits, any case)",
+             lambda x: isinstance(x, str) and _SHA256_RE.fullmatch(x) is not None)
+
+
+def _hash_eq(observed_hex: Any, expected_hex: str) -> bool:
+    """Case-insensitive digest compare (expected_hex is schema-validated)."""
+    return isinstance(observed_hex, str) and observed_hex.lower() == expected_hex.lower()
+
 
 FILE_EXISTS_EXPECT = {
-    "min_bytes": _V_NUM, "max_bytes": _V_NUM, "sha256": _V_STR,
+    "min_bytes": _V_NUM, "max_bytes": _V_NUM, "sha256": _V_SHA256,
     "modified_within_s": _V_NUM, "modified_after": _V_STR,
     "modified_before": _V_STR, "contains": _V_STR,
 }
 HTTP_OK_EXPECT = {
-    "status": _V_INT, "body_contains": _V_STR, "body_sha256": _V_STR,
+    "status": _V_INT, "body_contains": _V_STR, "body_sha256": _V_SHA256,
     "method": _V_STR, "allow_unsafe_method": _V_BOOL, "timeout_s": _V_ANY,
     "follow_redirects": _V_BOOL, "final_url_matches_target": _V_BOOL,
     "max_body_bytes": _V_INT,
@@ -75,7 +90,7 @@ DB_JSONL_EXPECT = {"where": _V_DICT, "match": _V_DICT, "occurrence": _V_STR}
 DB_JSON_EXPECT = {"fields": _V_DICT}
 EXIT_CODE_EXPECT = {
     "allow_shell": _V_BOOL, "exit_code": _V_INT, "stdout_contains": _V_STR,
-    "stdout_sha256": _V_STR, "timeout_s": _V_ANY, "workdir": _V_STR,
+    "stdout_sha256": _V_SHA256, "timeout_s": _V_ANY, "workdir": _V_STR,
     "max_output_bytes": _V_INT,
 }
 JSONL_OCCURRENCES = ("last", "first", "any", "count")
@@ -187,7 +202,7 @@ def probe_file_exists(target: str, expect: dict[str, Any] | None) -> tuple[dict,
         verdict = FAIL
     if "max_bytes" in expect and st.st_size > expect["max_bytes"]:
         verdict = FAIL
-    if "sha256" in expect and observed.get("sha256") != expect["sha256"]:
+    if "sha256" in expect and not _hash_eq(observed.get("sha256"), expect["sha256"]):
         verdict = FAIL
     if "modified_within_s" in expect:
         age = time.time() - st.st_mtime
@@ -268,18 +283,104 @@ def _hard_close(resp: Any) -> None:
         pass
 
 
+class _SocketRegistry:
+    """Every socket a single http_ok probe opens (one per connection, i.e.
+    per redirect hop that does not reuse a keep-alive connection). abort()
+    shuts them all down, which wakes any recv blocked in the HEADER phase,
+    the body phase or an intermediate redirect — requests' own timeout is
+    only per-read, so a server trickling one header byte at a time would
+    otherwise never trip it. A socket registered after abort() is shut down
+    immediately (a redirect hop that connected just after the deadline)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._socks: list = []
+        self.aborted = False
+
+    @staticmethod
+    def _shutdown(s: Any) -> None:
+        import socket
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError, ValueError):
+            pass
+
+    def add(self, s: Any) -> None:
+        if s is None:
+            return
+        with self._lock:
+            self._socks.append(s)
+            late = self.aborted
+        if late:
+            self._shutdown(s)
+
+    def abort(self) -> None:
+        with self._lock:
+            self.aborted = True
+            socks = list(self._socks)
+        for s in socks:
+            self._shutdown(s)
+
+
+def _deadline_session(requests: Any, registry: _SocketRegistry) -> Any:
+    """A requests.Session whose connections register their sockets with
+    `registry` (so a watchdog can abort the request at ANY phase). Falls back
+    to a plain Session if the urllib3 internals are not as expected — the
+    per-chunk deadline check and the post-headers _hard_close still apply."""
+    session = requests.Session()
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.connection import HTTPConnection, HTTPSConnection
+        from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+    except ImportError:
+        return session
+
+    def _tracked(base: type) -> type:
+        class _Tracked(base):  # type: ignore[misc, valid-type]
+            def connect(self, *a: Any, **k: Any) -> Any:
+                out = super().connect(*a, **k)
+                registry.add(getattr(self, "sock", None))
+                return out
+        return _Tracked
+
+    class _Pool(HTTPConnectionPool):
+        ConnectionCls = _tracked(HTTPConnection)
+
+    class _SPool(HTTPSConnectionPool):
+        ConnectionCls = _tracked(HTTPSConnection)
+
+    pools = {"http": _Pool, "https": _SPool}
+
+    class _Adapter(HTTPAdapter):
+        def init_poolmanager(self, *a: Any, **k: Any) -> None:
+            super().init_poolmanager(*a, **k)
+            self.poolmanager.pool_classes_by_scheme = pools
+
+        def proxy_manager_for(self, *a: Any, **k: Any) -> Any:
+            pm = super().proxy_manager_for(*a, **k)
+            pm.pool_classes_by_scheme = pools
+            return pm
+
+    adapter = _Adapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def probe_http_ok(target: str, expect: dict[str, Any] | None) -> tuple[dict, str]:
     """target: URL. expect keys (all optional; unknown keys -> UNVERIFIABLE):
     status (int, default 200), body_contains (str), body_sha256 (str),
     method (GET or HEAD only by default — probes must not mutate; pass
     "allow_unsafe_method": true to permit others), timeout_s (default 15;
-    must be a finite number > 0 — a TOTAL deadline covering connect, headers
-    and the whole body, not just a per-read timeout), follow_redirects (bool),
-    final_url_matches_target (bool), max_body_bytes (int > 0).
+    must be a finite number > 0 — a TOTAL deadline covering connect, headers,
+    every redirect hop and the whole body, not just a per-read timeout; only
+    DNS resolution is bounded by the OS resolver instead), follow_redirects
+    (bool), final_url_matches_target (bool), max_body_bytes (int > 0).
     Probe performs the request ITSELF — the claimer's reported response is
     never trusted.
     Environment failures (DNS failure, connection refused, timeout, deadline
-    exceeded) are UNVERIFIABLE, never FAIL.
+    exceeded), a refused method, and a body over max_body_bytes are
+    UNVERIFIABLE, never FAIL.
     KNOWN LIMITATIONS (fix gated on the MCP roadmap): target is fetched from
     the verifier's network position with NO host/IP filtering; redirects are
     followed by default; body_contains_found is recorded even when
@@ -297,8 +398,10 @@ def probe_http_ok(target: str, expect: dict[str, Any] | None) -> tuple[dict, str
 
     method = expect.get("method", "GET").upper()
     if method not in ("GET", "HEAD") and not expect.get("allow_unsafe_method"):
-        return {"error": f"method {method} refused — pass allow_unsafe_method "
-                         "to permit non-read-only requests"}, FAIL
+        # a refusal observes nothing — UNVERIFIABLE, never FAIL
+        return {"url": target, "method": method, "refused": True,
+                "error": f"method {method} refused — pass allow_unsafe_method "
+                         "to permit non-read-only requests"}, UNVERIFIABLE
     timeout, terr = _timeout_from(expect, 15)
     if terr:
         return {"url": target, "method": method, "error": terr}, UNVERIFIABLE
@@ -315,65 +418,84 @@ def probe_http_ok(target: str, expect: dict[str, Any] | None) -> tuple[dict, str
 
     def _timeout_result() -> tuple[dict, str]:
         observed["error"] = (f"timeout: total deadline of {timeout}s exceeded "
-                             "(connect + headers + body)")
+                             "(connect + headers + redirects + body)")
         observed["error_kind"] = "timeout"
         observed["timed_out"] = True
         return observed, UNVERIFIABLE
 
+    # TOTAL deadline. requests' timeout is per-read: a server trickling header
+    # bytes, a long redirect chain, or a slow-trickle body can each run far
+    # past timeout_s while every individual read stays under it. The watchdog
+    # starts BEFORE the request and tears down every socket the probe opened
+    # (header phase, each redirect hop, body); the body loop also checks the
+    # deadline per chunk. Only DNS resolution (getaddrinfo) cannot be
+    # interrupted — it is bounded by the OS resolver, not by timeout_s.
     deadline = time.monotonic() + timeout
-    try:
-        resp = requests.request(method, target, timeout=timeout,
-                                allow_redirects=allow_redirects, stream=True)
-    except Exception as e:  # noqa: BLE001 — network errors are UNVERIFIABLE
-        if isinstance(e, requests.exceptions.Timeout):
-            return _timeout_result()
-        observed["error"] = f"{type(e).__name__}: {e}"
-        observed["error_kind"] = ("connection" if isinstance(
-            e, requests.exceptions.ConnectionError) else "request")
-        return observed, UNVERIFIABLE
-
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        _hard_close(resp)
-        return _timeout_result()
-
-    # requests' timeout is per-read: a slow-trickle body can run forever while
-    # each individual read stays under it. A watchdog enforces the TOTAL
-    # deadline by tearing down the socket; the loop also checks it per chunk.
     timed_out = threading.Event()
+    registry = _SocketRegistry()
+    holder: dict[str, Any] = {}
 
     def _abort() -> None:
         timed_out.set()
-        _hard_close(resp)
+        registry.abort()
+        if "resp" in holder:
+            _hard_close(holder["resp"])
 
-    watchdog = threading.Timer(remaining, _abort)
+    def _expired() -> bool:
+        return timed_out.is_set() or time.monotonic() > deadline
+
+    watchdog = threading.Timer(timeout, _abort)
     watchdog.daemon = True
+    session = _deadline_session(requests, registry)
     watchdog.start()
-    # stream the body with a hard cap — never buffer an unbounded response
-    body = bytearray()
     try:
         try:
+            resp = session.request(method, target, timeout=timeout,
+                                   allow_redirects=allow_redirects, stream=True)
+        except Exception as e:  # noqa: BLE001 — network errors are UNVERIFIABLE
+            if _expired() or isinstance(e, requests.exceptions.Timeout):
+                return _timeout_result()
+            observed["error"] = f"{type(e).__name__}: {e}"
+            observed["error_kind"] = ("connection" if isinstance(
+                e, requests.exceptions.ConnectionError) else "request")
+            return observed, UNVERIFIABLE
+        holder["resp"] = resp
+        if _expired():
+            _hard_close(resp)
+            return _timeout_result()
+        # stream the body with a hard cap — never buffer an unbounded response
+        body = bytearray()
+        try:
             for chunk in resp.iter_content(8192):
-                if timed_out.is_set() or time.monotonic() > deadline:
+                if _expired():
                     timed_out.set()
                     break
                 body += chunk
                 if len(body) > max_body:
-                    resp.close()
+                    _hard_close(resp)
+                    # the body was never fully observed, so body assertions
+                    # cannot be judged: UNVERIFIABLE, not FAIL
                     observed.update({"status": resp.status_code,
                                      "final_url": resp.url,
                                      "body_limit_exceeded": True,
-                                     "max_body_bytes": max_body})
-                    return observed, FAIL
+                                     "max_body_bytes": max_body,
+                                     "error": f"response body exceeded "
+                                              f"max_body_bytes={max_body}",
+                                     "error_kind": "body_limit"})
+                    return observed, UNVERIFIABLE
         except Exception as e:  # noqa: BLE001
             _hard_close(resp)
-            if timed_out.is_set() or time.monotonic() > deadline:
+            if _expired():
                 return _timeout_result()
             observed["error"] = f"{type(e).__name__}: {e}"
             observed["error_kind"] = "read"
             return observed, UNVERIFIABLE
     finally:
         watchdog.cancel()
+        try:
+            session.close()
+        except Exception:  # noqa: BLE001
+            pass
     if timed_out.is_set() or time.monotonic() > deadline:
         _hard_close(resp)
         return _timeout_result()
@@ -398,7 +520,7 @@ def probe_http_ok(target: str, expect: dict[str, Any] | None) -> tuple[dict, str
         observed["body_contains_found"] = found
         if not found:
             verdict = FAIL
-    if "body_sha256" in expect and observed["body_sha256"] != expect["body_sha256"]:
+    if "body_sha256" in expect and not _hash_eq(observed["body_sha256"], expect["body_sha256"]):
         verdict = FAIL
     return observed, verdict
 
@@ -801,7 +923,10 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
     with file_exists/db_row_matches instead.
 
     Timeout -> UNVERIFIABLE (observed.timed_out): the exit code was never
-    observed. Cannot-spawn / binary not found (POSIX shell exit 126/127,
+    observed. Output over max_output_bytes -> UNVERIFIABLE
+    (observed.output_limit_exceeded): the command was killed unjudged.
+    Refused (no allow_shell) -> UNVERIFIABLE (observed.refused).
+    Cannot-spawn / binary not found (POSIX shell exit 126/127,
     Windows cmd 9009 or its "not recognized" message) -> UNVERIFIABLE.
     WARNING: stdout/stderr excerpts land in signed, shareable receipts — do
     not run commands that print secrets.
@@ -812,9 +937,11 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
     if err:
         return {"command": target, **err}, UNVERIFIABLE
     if not expect.get("allow_shell"):
-        return {"error": "exit_code probe refused — it executes arbitrary "
+        # a refusal observes nothing — UNVERIFIABLE, never FAIL
+        return {"command": target, "refused": True,
+                "error": "exit_code probe refused — it executes arbitrary "
                          "commands with the verifier's privileges; pass "
-                         '"allow_shell": true to opt in (see probe docstring)'}, FAIL
+                         '"allow_shell": true to opt in (see probe docstring)'}, UNVERIFIABLE
     timeout, terr = _timeout_from(expect, 30)
     if terr:
         return {"command": target, "error": terr}, UNVERIFIABLE
@@ -928,9 +1055,15 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
         t.join(timeout=10)
 
     if st["exceeded"]:
+        # the command was killed at the cap: its exit code / full output were
+        # never observed, so this cannot be judged — UNVERIFIABLE, not FAIL
         observed["output_limit_exceeded"] = True
         observed["stdout_bytes"] = st["n"]
-        return observed, FAIL
+        observed["max_output_bytes"] = max_out
+        observed["error"] = (f"stdout exceeded max_output_bytes={max_out}; "
+                             "command killed before it could be judged")
+        observed["error_kind"] = "output_limit"
+        return observed, UNVERIFIABLE
 
     stdout_text = st["head"].decode("utf-8", errors="replace")
     stderr_tail = st["err_tail"].decode("utf-8", errors="replace")
@@ -959,7 +1092,8 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
         observed["stdout_contains_found"] = st["found"]
         if not st["found"]:
             verdict = FAIL
-    if "stdout_sha256" in expect and observed["stdout_sha256"] != expect["stdout_sha256"]:
+    if "stdout_sha256" in expect and not _hash_eq(observed["stdout_sha256"],
+                                                  expect["stdout_sha256"]):
         verdict = FAIL
     return observed, verdict
 

@@ -11,7 +11,11 @@ Usage:
   python verify_receipt.py --pubkey verieffect_ed25519.pub --chain chain_myagent.jsonl
       [--agent myagent] [--expect-count N] [--expect-head HASH]
   add --require-verdict PASS to also gate on the verdict (default: exit code
-  reflects authenticity only)
+  reflects authenticity only). In chain mode, `repair_note` receipts (written
+  by `verieffect repair` in place of a torn receipt) are NOT verdicts: they
+  are excluded from the gate but always listed with a WARNING, since the
+  receipt they replaced may have been a FAIL. A chain with only repair notes
+  never meets the gate.
 
 Exit codes:
   0  authentic (and, with --require-verdict, every verdict matches)
@@ -135,6 +139,15 @@ def schema_errors(receipt) -> list:
     return errs
 
 
+def is_repair_note(r) -> bool:
+    """A `verieffect repair` marker (kept in sync with
+    verieffect.core.is_repair_note). It attests no effect, so the
+    --require-verdict gate skips it — but it stands in for a LOST receipt
+    (whose verdict is unknown), so chain mode always prints it."""
+    return (isinstance(r, dict) and r.get("kind") == "repair_note"
+            and r.get("verdict") == "UNVERIFIABLE")
+
+
 def verify_one(receipt, pub) -> tuple[bool, str]:
     """Never raises — returns (ok, reason) even on hostile/malformed input."""
     if not isinstance(receipt, dict):
@@ -237,6 +250,7 @@ def main() -> int:
     unverifiable_mismatch = 0     # mismatches where the actual verdict is UNVERIFIABLE
     verdict_counts = {vk: 0 for vk in VALID_VERDICTS}
     other_verdicts = 0
+    notes = []                    # (n, claim_id, checked_at, observed) of repair notes
     expected_agent = args.agent
     last = None
     prev_checked_at = None
@@ -297,11 +311,16 @@ def main() -> int:
                     for se in serrs[:4]:
                         print(f"      schema: {se}")
             vd = r.get("verdict") if isinstance(r, dict) else None
-            if isinstance(vd, str) and vd in verdict_counts:
+            if is_repair_note(r):
+                # not a verdict: counted and shown separately, never gated
+                obs = r.get("observed") if isinstance(r.get("observed"), dict) else {}
+                notes.append((n, r.get("claim_id"), r.get("checked_at"), obs))
+            elif isinstance(vd, str) and vd in verdict_counts:
                 verdict_counts[vd] += 1
             else:
                 other_verdicts += 1
-            if args.require_verdict is not None and vd != args.require_verdict:
+            if (args.require_verdict is not None and vd != args.require_verdict
+                    and not is_repair_note(r)):
                 if vd == "UNVERIFIABLE":
                     unverifiable_mismatch += 1
                 else:
@@ -341,17 +360,38 @@ def main() -> int:
     if other_verdicts:
         vsum += f", {other_verdicts} other/missing"
     print(f"verdicts: {vsum}")
+    real_verdicts = n - len(notes)
+    if notes:
+        print(f"repair notes: {len(notes)} (not verdicts — excluded from the "
+              "counts above and from --require-verdict)")
+        print(f"WARNING: {len(notes)} receipt(s) were torn and replaced by a "
+              "repair note; their verdicts are UNKNOWN (they may have been FAIL). "
+              "Inspect the .torn sidecar(s):")
+        for nn, ncid, nts, nobs in notes:
+            sha = str(nobs.get("torn_sha256", "?"))
+            print(f"  [{nn}] {ncid} @ {nts}: torn {nobs.get('torn_bytes', '?')} "
+                  f"bytes (sha256 {sha[:16]}…) -> {nobs.get('sidecar', '?')}")
+        if args.expect_count is not None and not args.expect_head:
+            print("  note: --expect-count alone cannot detect a repair (the note "
+                  "keeps the count); compare an anchored --expect-head.")
+    gate_empty = False
     if args.require_verdict is not None:
         total_mm = verdict_mismatch + unverifiable_mismatch
-        print(f"verdict requirement ({args.require_verdict}): "
-              + ("met" if total_mm == 0
-                 else f"{total_mm} receipt(s) differ "
-                      f"({unverifiable_mismatch} UNVERIFIABLE)"))
+        if real_verdicts == 0:
+            # only repair notes: nothing was verified, the gate cannot be met
+            gate_empty = True
+            print(f"verdict requirement ({args.require_verdict}): NOT met — "
+                  "no verdict-bearing receipts (only repair notes)")
+        else:
+            print(f"verdict requirement ({args.require_verdict}): "
+                  + ("met" if total_mm == 0
+                     else f"{total_mm} receipt(s) differ "
+                          f"({unverifiable_mismatch} UNVERIFIABLE)"))
     if bad == 0 and args.expect_count is None and not args.expect_head:
         print("note: forward-walk intact. Tail truncation/regeneration is only "
-              "detectable with --expect-count/--expect-head (anchor the head "
-              "externally).")
-    if bad or verdict_mismatch:
+              "detectable with --expect-head (anchor the head externally); "
+              "--expect-count alone misses a repaired tail.")
+    if bad or verdict_mismatch or gate_empty:
         return EXIT_INVALID
     if unverifiable_mismatch:
         return EXIT_UNVERIFIABLE

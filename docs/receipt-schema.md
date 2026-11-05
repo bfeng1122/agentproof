@@ -106,6 +106,16 @@ non-object `--expect` as `{"_non_object_expect": <value>}` so the receipt's
 `timeout_s` everywhere: a finite number `> 0` and `≤ 86400`. Anything else is
 `UNVERIFIABLE`, never "wait forever."
 
+`sha256` / `body_sha256` / `stdout_sha256`: exactly 64 hex digits. Case is ignored
+(PowerShell's `Get-FileHash` emits uppercase), so an uppercase digest of the right
+content PASSes. Anything else (wrong length, non-hex, empty) is `UNVERIFIABLE`, not
+`FAIL`.
+
+The CLI parses `--expect` strictly: duplicate keys (`{"min_bytes": 999999,
+"min_bytes": 1}`) and `NaN`/`Infinity` are a usage error (exit 2, no receipt) —
+plain JSON parsing would silently keep the last duplicate. A non-object `--expect`
+(including `null`) is `UNVERIFIABLE` and is never probed.
+
 **A probe that asserts nothing proves nothing.** `db_row_matches` requires at least
 one result assertion. For sqlite that is `rows` and/or `row_count`. For jsonl it is a
 non-empty `match`, and for json a non-empty `fields`. Without one, the verdict is
@@ -118,7 +128,7 @@ documented purpose.
 | Tool | 0 | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|---|
 | `verieffect claim` | PASS | FAIL | usage error / claim aborted, no receipt written | UNVERIFIABLE (receipt written) | internal error |
-| `verify_receipt.py` | authentic (and, with `--require-verdict`, all verdicts match) | invalid/tampered/malformed, `--agent` mismatch, empty chain, or a non-UNVERIFIABLE verdict mismatch | usage error | authentic, but `--require-verdict` failed only because of UNVERIFIABLE verdicts | internal error |
+| `verify_receipt.py` | authentic (and, with `--require-verdict`, all verdicts match) | invalid/tampered/malformed, `--agent` mismatch, empty chain (or, with `--require-verdict`, a chain of only repair notes), or a non-UNVERIFIABLE verdict mismatch | usage error | authentic, but `--require-verdict` failed only because of UNVERIFIABLE verdicts | internal error |
 
 `verieffect verify`/`audit`/`checkpoint`/`repair` use `0` = OK, `1` = invalid/broken,
 `2` = could not run (missing key, unparsable input, no receipts).
@@ -131,6 +141,11 @@ documented purpose.
   POSIX shell exit 126/127, or on Windows cmd exit 9009 or its "not recognized"
   message. `FAIL` is reserved for a genuine mismatch between observed state and the
   expectation.
+- **Refusals and caps are `UNVERIFIABLE`, never `FAIL`.** A refused probe observes
+  nothing (`exit_code` without `allow_shell`, `http_ok` with a non-GET/HEAD method
+  and no `allow_unsafe_method`; `observed.refused: true`), and a response or output
+  over its size cap was never fully observed (`observed.body_limit_exceeded` /
+  `observed.output_limit_exceeded`). Neither is a mismatch.
 - A missing target file is `FAIL` for `file_exists`/`db_row_matches` (the claimed
   record does not exist), not `UNVERIFIABLE`. So is a target that exists but is
   not a regular file: `file_exists` follows symlinks and requires `S_ISREG`, and a
@@ -151,8 +166,12 @@ documented purpose.
   recorded: a count/rows expectation smaller than the cap is then a definite
   `FAIL`, and a larger one is `UNVERIFIABLE`.
 - `http_ok` `timeout_s` (default 15 s) is a **total** deadline covering connect,
-  headers and the whole body, not just a per-read timeout. A slow-trickle body is
-  aborted at the deadline and is `UNVERIFIABLE` (`observed.timed_out`).
+  the header phase, every redirect hop and the whole body, not just a per-read
+  timeout. A watchdog started *before* the request shuts down every socket the
+  probe opened when the deadline passes, so trickled headers, a long redirect chain
+  or a slow-trickle body are all aborted at the deadline and are `UNVERIFIABLE`
+  (`observed.timed_out`). One exception: DNS resolution (`getaddrinfo`) cannot be
+  interrupted and is bounded by the OS resolver, not by `timeout_s`.
 - `db_row_matches` accepts read-only queries only (`SELECT`/`WITH` for sqlite, with
   `PRAGMA query_only` as a second enforcement layer); anything else is rejected
   before execution. Multi-statement batches (`SELECT 1; DROP TABLE x`) are refused
@@ -165,7 +184,7 @@ documented purpose.
   redirect as the final response, or `"final_url_matches_target": true` to FAIL
   when the redirect chain ends anywhere other than the exact target URL.
   Response bodies are STREAMED with a hard cap (`max_body_bytes`, default
-  32 MiB): exceeding it FAILs with `observed.body_limit_exceeded` and the
+  32 MiB): exceeding it is `UNVERIFIABLE` with `observed.body_limit_exceeded` and the
   connection is closed — the verifier's memory is never at the mercy of the
   target.
 - `exit_code` is gated OFF by default (`allow_shell: true` required — but see
@@ -177,8 +196,8 @@ documented purpose.
   was never observed), no
   stdin, and STREAMING output capture with a hard byte cap (`max_output_bytes`,
   default 64 MiB): stdout is hashed and counted chunk-by-chunk with only a 1 KiB
-  head excerpt buffered; exceeding the cap FAILs with
-  `observed.output_limit_exceeded`. On timeout, output cap, and normal exit the
+  head excerpt buffered; exceeding the cap is `UNVERIFIABLE` with
+  `observed.output_limit_exceeded` (the command is killed unjudged). On timeout, output cap, and normal exit the
   process **tree** is killed, not just the shell:
   - **POSIX:** the command runs in its own session; the whole process group is
     `SIGKILL`ed, including background children left behind after a normal exit.
@@ -212,7 +231,9 @@ documented purpose.
 
 - Default root: `~/.verieffect` (Windows `%USERPROFILE%\.verieffect`), overridable
   with `VERIEFFECT_HOME`. Through 0.1.0a1 the default was `./data` under the CWD. If
-  that legacy directory has keys and the per-user root does not exist, the CLI
+  that legacy directory holds a Verieffect private key
+  (`./data/keys/verieffect_ed25519.pem` — an unrelated `./data/keys` folder does not
+  count) and the per-user root does not exist, the CLI
   prints the exact move command and refuses to create a second key. It never
   moves files itself.
 - Keys are created atomically: a temp file is opened `O_CREAT|O_EXCL` with mode
@@ -224,6 +245,13 @@ documented purpose.
   signed `kind: "repair_note"` receipt with verdict `UNVERIFIABLE`. That receipt
   records the torn line's size and sha256. Only a torn *tail* is repaired. Damage
   further up is refused, and you should audit it.
+- **Repair notes are evidence of a lost receipt, not a verdict.** The torn
+  receipt's verdict is unknown (a clipped FAIL looks like any other torn line).
+  `audit` and `verify_receipt.py --chain` therefore list every repair note under a
+  WARNING. They are excluded from the verdict counts and from `--require-verdict`,
+  so one repair does not block a strict gate forever; a chain containing *only*
+  repair notes never meets the gate. Because a repair keeps the receipt count,
+  `--expect-count` cannot detect it: anchor and compare `--expect-head`.
 
 ## Threat model (what receipts do and don't prove)
 
@@ -243,6 +271,8 @@ chain is audited with `--agent`) belongs to the claimed agent.
    to a forward walk. Mitigation: anchor the chain head externally (publish
    `sha256(last receipt)` + count — a daily git commit, an OpenTimestamps stamp, a
    posted checkpoint) and audit with `--expect-head` / `--expect-count`.
+   **Count-only anchoring is not sufficient:** a torn-and-repaired tail keeps the
+   count (the repair note replaces the lost receipt), so always anchor the head.
 3. **Key-holder regeneration.** Whoever holds the private key can rebuild an
    entire chain that verifies. External anchoring (limit 2) is also the mitigation:
    once a head hash is published, a regenerated chain won't match it.

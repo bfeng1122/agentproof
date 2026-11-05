@@ -647,6 +647,32 @@ def verify_receipt(receipt: dict, pub_pem: str | bytes) -> tuple[bool, str]:
     return True, "signature valid"
 
 
+REPAIR_NOTE_KIND = "repair_note"
+
+
+def is_repair_note(r: Any) -> bool:
+    """A `verieffect repair` marker: attests no effect, so verdict gates skip
+    it — but audits must still display it (it stands in for a lost receipt)."""
+    return (isinstance(r, dict) and r.get("kind") == REPAIR_NOTE_KIND
+            and r.get("verdict") == "UNVERIFIABLE")
+
+
+def repair_notes(receipts: list) -> list[tuple[int, dict]]:
+    """(index, receipt) for every repair note in a chain."""
+    return [(i, r) for i, r in enumerate(receipts) if is_repair_note(r)]
+
+
+def describe_repair_notes(notes: list[tuple[int, dict]]) -> list[str]:
+    out = []
+    for i, r in notes:
+        obs = r.get("observed") if isinstance(r.get("observed"), dict) else {}
+        sha = str(obs.get("torn_sha256", "?"))
+        out.append(f"[{i}] {r.get('claim_id', '?')} @ {r.get('checked_at', '?')}: "
+                   f"torn {obs.get('torn_bytes', '?')} bytes (sha256 {sha[:16]}…) "
+                   f"-> {obs.get('sidecar', '?')}")
+    return out
+
+
 def verify_chain(receipts: list[dict], pub_pem: str | bytes,
                  expected_agent_id: str | None = None) -> list[str]:
     """Full audit: every signature valid, hash chain unbroken from genesis,

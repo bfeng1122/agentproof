@@ -33,8 +33,9 @@ import uuid
 from pathlib import Path
 
 from .core import (
-    ChainStore, Keyring, receipt_body, receipt_hash, schema_errors,
-    sign_receipt, strict_loads, verify_chain, verify_receipt,
+    ChainStore, Keyring, describe_repair_notes, receipt_body, receipt_hash,
+    repair_notes, schema_errors, sign_receipt, strict_loads, verify_chain,
+    verify_receipt,
 )
 from .probes import PROBES
 
@@ -66,13 +67,16 @@ def home() -> Path:
 
 def _legacy_home() -> Path | None:
     """Through 0.1.0a1 the default was ./data under the CWD. Returns that dir when it
-    holds keys, the per-user home does not exist yet, and VERIEFFECT_HOME is
-    unset — i.e. when a migration notice is due."""
+    holds a Verieffect private key (keys/verieffect_ed25519.pem — not merely
+    any keys/ folder: an unrelated project's ./data/keys must not block a new
+    user's first claim), the per-user home does not exist yet, and
+    VERIEFFECT_HOME is unset — i.e. when a migration notice is due."""
     if os.environ.get("VERIEFFECT_HOME"):
         return None
     legacy = Path.cwd() / "data"
     try:
-        if (legacy / "keys").exists() and not default_home().exists():
+        if ((legacy / "keys" / "verieffect_ed25519.pem").is_file()
+                and not default_home().exists()):
             return legacy
     except OSError:
         return None
@@ -124,17 +128,22 @@ def cmd_claim(args: argparse.Namespace) -> int:
         expect = {}
     else:
         try:
-            def _no_nan(x):
-                raise ValueError(f"non-finite JSON constant not allowed: {x}")
-            expect = json.loads(args.expect, parse_constant=_no_nan)
+            # strict: duplicate keys are rejected — plain json.loads lets the
+            # LAST duplicate win silently, so {"min_bytes": 999999,
+            # "min_bytes": 1} would assert 1 while the user meant 999999
+            expect = strict_loads(args.expect)
         except (ValueError, RecursionError) as e:
-            print(f"--expect must be valid JSON (no NaN/Infinity): "
-                  f"{type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+            print(f"--expect must be valid JSON (no duplicate keys, no "
+                  f"NaN/Infinity): {type(e).__name__}: {str(e)[:200]}",
+                  file=sys.stderr)
             return EXIT_USAGE
-    # a non-object --expect (e.g. [] or null) is passed to the probe as-is,
-    # which returns UNVERIFIABLE; the receipt's expect field must still be an
-    # object (schema), so the raw value is recorded under a marker key
-    receipt_expect = expect if isinstance(expect, dict) else {"_non_object_expect": expect}
+    # a non-object --expect (e.g. [], 5 or null) is never probed: it is
+    # UNVERIFIABLE. It must NOT reach the probe — library probes treat None as
+    # {} (no extra assertions), which made `--expect null` PASS. The receipt's
+    # expect field must still be an object (schema), so the raw value is
+    # recorded under a marker key.
+    non_object = not isinstance(expect, dict)
+    receipt_expect = {"_non_object_expect": expect} if non_object else expect
 
     rc = _migration_check(creates_state=True)
     if rc is not None:
@@ -150,7 +159,13 @@ def cmd_claim(args: argparse.Namespace) -> int:
     # A probe crash (malformed expect, unexpected data) must still produce a
     # receipt — never a traceback with no evidence written.
     try:
-        observed, verdict = PROBES[args.kind](args.target, expect)
+        if non_object:
+            observed = {"error": f"expect must be a JSON object for {args.kind}, "
+                                 f"got {'null' if expect is None else type(expect).__name__}"
+                                 " — refusing to judge"}
+            verdict = "UNVERIFIABLE"
+        else:
+            observed, verdict = PROBES[args.kind](args.target, expect)
     except Exception as e:  # noqa: BLE001
         observed = {"error": f"probe crashed: {type(e).__name__}: {e}"}
         verdict = "UNVERIFIABLE"
@@ -283,16 +298,34 @@ def cmd_audit(args: argparse.Namespace) -> int:
             f"{head_hash[:16]}… (possible tail truncation or regeneration)")
     print(f"chain head: {head_hash}")
     print(f"last receipt: {last_cid} @ {last_ts}")
+    notes = repair_notes(receipts)
+    if notes:
+        # a repair replaces a torn receipt one-for-one, so the chain is intact
+        # and the count unchanged — the lost receipt (possibly a FAIL) would
+        # be invisible unless we say so loudly
+        print(f"WARNING: {len(notes)} repair note(s) in this chain. Each marks a "
+              "torn receipt that `verieffect repair` moved to a .torn sidecar; "
+              "that receipt's verdict is UNKNOWN (it may have been a FAIL):")
+        for line in describe_repair_notes(notes):
+            print("  " + line)
+        print("  Inspect the sidecar file(s). An anchored --expect-count cannot "
+              "detect a repair (the note keeps the count); compare an anchored "
+              "--expect-head.")
     if problems:
         print("CHAIN BROKEN / SIGNATURES INVALID:")
         for p in problems:
             print(" ", p)
         return 1
-    print("chain intact, all signatures valid ✓")
+    suffix = (f" — but {len(notes)} repair note(s), see WARNING above"
+              if notes else "")
+    print(f"chain intact, all signatures valid ✓{suffix}")
+    if notes and args.expect_count is not None and not args.expect_head:
+        print("note: --expect-count alone is NOT sufficient here: a repaired "
+              "tail keeps the receipt count. Anchor and pass --expect-head.")
     if args.expect_count is None and not args.expect_head:
         print("note: intact ⇒ no edits/mid-chain deletions detected. Tail "
-              "truncation is only detectable via --expect-count/--expect-head "
-              "(anchor the head externally).")
+              "truncation is only detectable via --expect-head (anchor the head "
+              "externally); --expect-count alone misses a repaired tail.")
     return 0
 
 

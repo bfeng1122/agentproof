@@ -26,7 +26,7 @@ $ verieffect claim file_exists --agent backup-cron \
 }
 $ echo $?
 1
-$ python verify_receipt.py --pubkey data/keys/verieffect_ed25519.pub receipt.json
+$ python verify_receipt.py --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
 VALID: ok (claim 830c4620-deb4-4d5e-a4d2-ed83c77f79da, verdict FAIL)
 ```
 (output from a Windows run — observed.path uses backslashes)
@@ -50,9 +50,9 @@ The signed `FAIL` receipt is the evidence, and exit code `1` lets cron alert on 
   state, HTTP responses, database rows, command exit codes. A model never *opines*
   that work succeeded; evidence shows it.
 - **Signed receipts.** Ed25519 signature + per-agent hash chain, so receipts can't be
-  forged or silently edited after the fact. (Honest scope: the chain detects edits and
-  mid-chain deletions; tail truncation needs an externally anchored head hash —
-  see [Checkpointing](#checkpointing-anti-truncation) below.)
+  altered without the key, and edits after the fact are detected. (Honest scope: the
+  chain detects edits and mid-chain deletions; tail truncation needs an externally
+  anchored head hash — see [Checkpointing](#checkpointing-anti-truncation) below.)
 - **Three verdicts, never two.** `PASS` / `FAIL` / `UNVERIFIABLE`, each with its own
   exit code (`0` / `1` / `3`). A network error, timeout or missing binary is never
   laundered into a pass (or a fail). A missing file is never excused as "couldn't
@@ -180,8 +180,8 @@ cron jobs can branch on verification results directly:
 |---|---|
 | `0` | PASS |
 | `1` | FAIL — the observed state contradicts the expectation |
-| `3` | UNVERIFIABLE — ground truth couldn't be reached or judged (network error, timeout, binary not found, malformed/unknown `expect` key, no assertion). A receipt is still written. |
-| `2` | usage error, or claim aborted before any receipt was written (bad `--expect` JSON, corrupt chain tail, lock timeout) |
+| `3` | UNVERIFIABLE — ground truth couldn't be reached or judged (network error, timeout, binary not found, malformed/unknown `expect` key, non-object `expect` such as `null`, malformed SHA-256, no assertion, a refused probe — `exit_code` without `allow_shell`, non-GET/HEAD `http_ok` — or a response/output over its size cap). A receipt is still written. |
+| `2` | usage error, or claim aborted before any receipt was written (bad `--expect` JSON incl. duplicate keys, corrupt chain tail, lock timeout) |
 | `4` | internal error (a Verieffect bug — please report it) |
 
 Exit codes — offline verifier (`verify_receipt.py`). Verification checks
@@ -214,14 +214,19 @@ inside whatever repo the agent happens to run in.
   your machine.
 - `~/.verieffect/chains/chain_<agent>_<hash8>.jsonl` — append-only receipt chain per agent.
 - Override the root with `VERIEFFECT_HOME=/some/path`.
-- **Upgrading from 0.1.0a1** (old default: `./data` under the CWD): if `./data/keys`
-  exists and `~/.verieffect` doesn't, Verieffect prints the exact move command and
+- **Upgrading from 0.1.0a1 to 0.2.0a1** (old default: `./data` under the CWD): if
+  `./data/keys/verieffect_ed25519.pem` exists and `~/.verieffect` doesn't (an
+  unrelated `./data/keys` folder is ignored), Verieffect prints the exact move command and
   refuses to mint a second key until you either move the directory
   (`mv ./data ~/.verieffect`, Windows: `move data "%USERPROFILE%\.verieffect"`) or
   set `VERIEFFECT_HOME` to the old path. Nothing is moved automatically.
 - **Crash recovery:** if a crash tears the last chain line mid-write, new claims for
   that agent stop with a pointer to `verieffect repair --agent <id>`. That command
   moves the torn line to `<chain>.torn` and appends a signed `repair_note` receipt.
+  The torn receipt's verdict is lost (it may have been a FAIL), so `audit` and
+  `verify_receipt.py --chain` always print a **WARNING** listing every repair note.
+  Repair notes are not verdicts: `--require-verdict` skips them (one repair does not
+  block a strict gate forever), but a chain of *only* repair notes never meets it.
 
 ## How it compares
 
@@ -232,7 +237,7 @@ inside whatever repo the agent happens to run in.
 | Offline verification | Yes | Yes | Yes | Yes | No (SaaS) |
 | Deployment | Local CLI/library | Local CLI + hub | Local + countersign service | Local OSS | Hosted SaaS |
 | Scope | Technical claims (files/HTTP/DB/exit) | Agent sessions | Agent transcripts | Action trails | Business outcomes (Stripe, orders) |
-| License | MIT | Apache-2.0 | Pre-Alpha (per PyPI) | Apache-2.0 | Proprietary |
+| License | MIT | Apache-2.0 | MIT (Pre-Alpha) | Apache-2.0 | Proprietary |
 
 The one-column summary: **the receipt tools above prove what the agent *recorded
 doing*; Verieffect checks whether the effect *actually landed*.** A lying agent can
@@ -312,6 +317,11 @@ output, an OpenTimestamps stamp, a message to a channel only you control. Later:
 ```bash
 python -m verieffect.cli audit --agent my-agent --expect-count 42 --expect-head 0dabf352...
 ```
+
+**Anchor the head, not just the count.** `--expect-count` alone is not sufficient:
+`verieffect repair` replaces a torn receipt with a repair note one-for-one, so a
+clipped FAIL plus a repair keeps the count unchanged. Only `--expect-head` catches it
+(and `audit` prints the repair-note WARNING either way).
 
 ### Prefer body hashes over substrings
 

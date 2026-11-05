@@ -1,8 +1,49 @@
 # Changelog
 
-## Unreleased — pre-launch hardening round 2
+## v0.2.0a1 — 2026-11-05 (not yet tagged)
 
-### False-pass fixes (verdict semantics)
+Breaking changes since 0.1.0a1: new default data dir, new exit codes, stricter
+`expect` validation, and refusals/caps are now UNVERIFIABLE instead of FAIL. The
+sections below cover the pre-launch hardening rounds.
+
+### Review round 4
+- **False-pass fix:** `--expect null` was probed as `{}` and PASSed. Any
+  non-object `--expect` (`null`, `[]`, `5`, …) is now UNVERIFIABLE and never
+  reaches the probe.
+- **False-pass fix:** `--expect` is parsed strictly. Duplicate keys
+  (`{"min_bytes": 999999, "min_bytes": 1}`, where the last value silently won) are
+  a usage error (exit 2, no receipt).
+- **Verdict semantics (breaking):** refusals and size caps are UNVERIFIABLE, not
+  FAIL, because nothing was observed. This covers `exit_code` without
+  `allow_shell`, `http_ok` with a non-GET/HEAD method, a body over
+  `max_body_bytes`, and output over `max_output_bytes`. Refusals record
+  `observed.refused: true`. FAIL now means only "observed state contradicts the
+  expectation".
+- **SHA-256 expectations** (`sha256`, `body_sha256`, `stdout_sha256`) are
+  case-insensitive, so PowerShell `Get-FileHash` uppercase output PASSes. A
+  malformed digest (wrong length, non-hex, empty) is UNVERIFIABLE instead of FAIL.
+- **`http_ok` `timeout_s` is a real total deadline.** The watchdog starts before
+  the request and shuts down every socket the probe opened, covering the header
+  phase and every redirect hop as well as the body. Before this fix, with
+  `timeout_s: 1`, trickled headers ran 13.6 s and 8 redirects ran 4.5 s. Only DNS
+  resolution stays bounded by the OS resolver; this is documented.
+- **Repair notes are visible and don't brick strict gates.** `audit` and
+  `verify_receipt.py --chain` print a WARNING listing every `repair_note`, because
+  the torn receipt's verdict is unknown and may have been a FAIL. Repair notes are
+  excluded from verdict counts and from `--require-verdict`, so one repair no
+  longer makes `--require-verdict PASS` exit 3 forever. A chain of only repair
+  notes never meets the gate. Docs now state that count-only anchoring is not
+  sufficient, because a repair keeps the count; anchor `--expect-head`.
+- **Migration check** looks for `./data/keys/verieffect_ed25519.pem`, not just
+  any `./data/keys` folder. An unrelated project folder no longer blocks a new
+  user's first claim.
+- Docs: the README demo uses the per-user key path. Attestroot's license column
+  now reads "MIT (Pre-Alpha)". "Can't be forged" is now "can't be altered without
+  the key".
+
+### Round 2 (pre-launch hardening)
+
+#### False-pass fixes (verdict semantics)
 - Strict per-probe `expect` schemas: unknown keys (e.g. `min_byte`), wrong value
   types and non-object `expect` are now UNVERIFIABLE naming the key(s); they no
   longer PASS silently.
@@ -14,7 +55,7 @@
 - Environment failures (missing binary, connection refused, DNS, timeouts) are
   UNVERIFIABLE, not FAIL.
 
-### Behavior changes
+#### Behavior changes
 - **Exit codes:** `claim` now exits 0 PASS / 1 FAIL / **3 UNVERIFIABLE** / 2
   usage / 4 internal error. `verify_receipt.py` exits 3 when `--require-verdict`
   fails only on UNVERIFIABLE verdicts, and 4 on an internal error.

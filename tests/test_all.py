@@ -208,7 +208,10 @@ def _run_all(tmp):
     check("command exit 0 + stdout -> PASS", v == PASS)
     check("exit_code observed in receipt", obs.get("exit_code") == 0)
     obs, v = probe_exit_code(f'"{PY}" -c "print(2+2)"', {"exit_code": 0})
-    check("exit_code WITHOUT allow_shell -> refused FAIL", v == FAIL and "refused" in str(obs.get("error", "")))
+    # round 4 item 9: a refusal observes nothing -> UNVERIFIABLE (was FAIL)
+    check("exit_code WITHOUT allow_shell -> refused UNVERIFIABLE (not FAIL)",
+          v == UNVERIFIABLE and "refused" in str(obs.get("error", ""))
+          and obs.get("refused") is True)
     obs, v = probe_exit_code(f'"{PY}" -c "import sys; sys.exit(3)"', {**SHELL_OK, "exit_code": 3})
     check("nonzero exit matches expected -> PASS", v == PASS)
     obs, v = probe_exit_code(f'"{PY}" -c "import sys; sys.exit(3)"', SHELL_OK)
@@ -291,8 +294,8 @@ def _run_all(tmp):
     obs, v = probe_exit_code(
         f'"{PY}" -c "import sys; sys.stdout.write(\'A\'*(50*1024*1024))"',
         {**SHELL_OK, "max_output_bytes": 1024 * 1024})
-    check("output over cap -> FAIL with output_limit_exceeded",
-          v == FAIL and obs.get("output_limit_exceeded") is True)
+    check("output over cap -> UNVERIFIABLE with output_limit_exceeded (round 4: was FAIL)",
+          v == UNVERIFIABLE and obs.get("output_limit_exceeded") is True)
     obs, v = probe_exit_code(f'"{PY}" -c "print(\'needle123\')"',
                              {**SHELL_OK, "stdout_contains": "needle123"})
     check("streaming substring search still works", v == PASS)
@@ -438,8 +441,9 @@ def _run_all(tmp):
 
     # --- http_ok refuses non-GET/HEAD methods by default (M3 partial) ---
     obs, v = probe_http_ok("http://127.0.0.1:1/", {"method": "DELETE"})
-    check("http_ok DELETE refused without allow_unsafe_method",
-          v == FAIL and "refused" in str(obs.get("error", "")))
+    check("http_ok DELETE refused without allow_unsafe_method -> UNVERIFIABLE (round 4: was FAIL)",
+          v == UNVERIFIABLE and "refused" in str(obs.get("error", ""))
+          and obs.get("refused") is True)
 
     # --- verify_receipt robustness: non-string sig no longer raises (M4) ---
     ok_r, why_r = verify_receipt({"v": 1, "sig": 123, "claim_id": "x"}, pub_pem)
@@ -1275,6 +1279,9 @@ def _run_all(tmp):
             os.environ["VERIEFFECT_HOME"] = saved_home
     legacy_cwd = tmp / "legacy_cwd"
     (legacy_cwd / "data" / "keys").mkdir(parents=True)
+    # round 4 item 11: only a real Verieffect private key triggers migration
+    (legacy_cwd / "data" / "keys" / "verieffect_ed25519.pem").write_text(
+        "placeholder", encoding="utf-8")
     fake_home = tmp / "fake_home"
     fake_home.mkdir()
     lenv = {k_: v_ for k_, v_ in os.environ.items() if k_ != "VERIEFFECT_HOME"}
@@ -1364,6 +1371,296 @@ def _run_all(tmp):
     pyproj = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     check("pyproject ships verify_receipt.py in the wheel (py-modules)",
           'py-modules = ["verify_receipt"]' in pyproj)
+
+    _run_round4(tmp, f=f, env=env, _cli=_cli, run_vr=run_vr, write_lines=write_lines,
+                cli_priv=cli_priv, cli_pub_path=cli_pub_path, SHELL_OK=SHELL_OK,
+                r2_store=r2_store, pyproj=pyproj)
+
+
+def _serve(handler):
+    """Tiny multi-connection HTTP test server. handler(conn, request_line, port)
+    writes the raw response. Returns (port, stop_event)."""
+    import socket as _socket
+    import threading as _thr
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    srv.settimeout(0.25)
+    port = srv.getsockname()[1]
+    stop = _thr.Event()
+
+    def _handle(conn):
+        try:
+            conn.settimeout(20)
+            req = conn.recv(65536).decode("latin-1", "replace")
+            handler(conn, req.split("\r\n", 1)[0], port)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _loop():
+        while not stop.is_set():
+            try:
+                conn, _addr = srv.accept()
+            except _socket.timeout:
+                continue
+            except OSError:
+                break
+            _thr.Thread(target=_handle, args=(conn,), daemon=True).start()
+        srv.close()
+
+    _thr.Thread(target=_loop, daemon=True).start()
+    return port, stop
+
+
+def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_path,
+                SHELL_OK, r2_store, pyproj):
+    import hashlib
+    import time as _time
+    import verify_receipt as vr
+    import verieffect
+    import verieffect.core as vcore
+    import verieffect.probes as vprobes_mod
+    from verieffect.core import schema_errors as core_schema_errors
+    tmp = Path(tmp)
+
+    print("== round 4: --expect null / non-object (item 1) ==")
+    for raw in ("null", "5", '"x"'):
+        out_p = tmp / f"r4_nonobj_{len(raw)}.json"
+        cp = _cli("claim", "file_exists", "--agent", "r4", "--target", str(f),
+                  "--expect", raw, "--out", str(out_p))
+        rec_ = json.loads(out_p.read_text(encoding="utf-8")) if out_p.exists() else {}
+        check(f"CLI --expect {raw}: exit 3 UNVERIFIABLE, schema-valid receipt "
+              f"(null was a false PASS; rc={cp.returncode})",
+              cp.returncode == 3 and rec_.get("verdict") == "UNVERIFIABLE"
+              and rec_.get("expect") == {"_non_object_expect": json.loads(raw)}
+              and core_schema_errors(rec_) == []
+              and "expect must be a JSON object" in str(rec_.get("observed", {}).get("error")))
+
+    print("== round 4: duplicate --expect keys (item 2) ==")
+    dup_out = tmp / "r4_dup.json"
+    cp = _cli("claim", "file_exists", "--agent", "r4", "--target", str(f),
+              "--expect", '{"min_bytes": 999999, "min_bytes": 1}', "--out", str(dup_out))
+    check(f"CLI duplicate expect keys -> exit 2, 'duplicate' named, no receipt "
+          f"(was false PASS; rc={cp.returncode})",
+          cp.returncode == 2 and "duplicate" in cp.stderr.lower() and not dup_out.exists()
+          and "Traceback" not in cp.stderr)
+    cp = _cli("claim", "file_exists", "--agent", "r4", "--target", str(f),
+              "--expect", '{"min_bytes": NaN}')
+    check("CLI NaN in --expect still rejected (exit 2)", cp.returncode == 2)
+
+    print("== round 4: SHA-256 case + format (item 10) ==")
+    real = hashlib.sha256(f.read_bytes()).hexdigest()
+    obs, v = probe_file_exists(str(f), {"sha256": real.upper()})
+    check("file_exists uppercase sha256 of the right file -> PASS (was FAIL)", v == PASS)
+    mixed = "".join(c.upper() if i % 2 else c for i, c in enumerate(real))
+    obs, v = probe_file_exists(str(f), {"sha256": mixed})
+    check("file_exists mixed-case sha256 -> PASS", v == PASS)
+    obs, v = probe_file_exists(str(f), {"sha256": ("F" * 64)})
+    check("file_exists wrong (well-formed, uppercase) sha256 -> FAIL", v == FAIL)
+    malformed = ["", "abc", real[:63], real + "0", "z" * 64, " " + real[:63], real[:63] + "\n"]
+    mres = [probe_file_exists(str(f), {"sha256": m}) for m in malformed]
+    check("file_exists malformed sha256 (empty/short/long/non-hex/whitespace) -> "
+          "UNVERIFIABLE naming sha256 (was FAIL)",
+          all(v_ == UNVERIFIABLE and "sha256" in str(o_.get("error", "")) for o_, v_ in mres))
+    obs, v = probe_http_ok("http://127.0.0.1:1/", {"body_sha256": "nothex"})
+    check("http_ok malformed body_sha256 -> UNVERIFIABLE before any request",
+          v == UNVERIFIABLE and "body_sha256" in str(obs.get("error", "")))
+    cmd_x = f'"{PY}" -c "print(\'x\')"'
+    obs0, _v0 = probe_exit_code(cmd_x, SHELL_OK)
+    obs, v = probe_exit_code(cmd_x, {**SHELL_OK, "stdout_sha256": obs0["stdout_sha256"].upper()})
+    check("exit_code uppercase stdout_sha256 -> PASS", v == PASS)
+    obs, v = probe_exit_code(cmd_x, {**SHELL_OK, "stdout_sha256": "123"})
+    check("exit_code malformed stdout_sha256 -> UNVERIFIABLE",
+          v == UNVERIFIABLE and "stdout_sha256" in str(obs.get("error", "")))
+    cp = _cli("claim", "file_exists", "--agent", "r4", "--target", str(f),
+              "--expect", json.dumps({"sha256": real.upper()}))
+    check("CLI uppercase sha256 (PowerShell Get-FileHash style) -> exit 0", cp.returncode == 0)
+
+    print("== round 4: refusals and caps are UNVERIFIABLE (item 9) ==")
+    cp = _cli("claim", "exit_code", "--agent", "r4", "--target", cmd_x, "--expect", "{}")
+    check(f"CLI exit_code without allow_shell -> exit 3 (was 1; rc={cp.returncode})",
+          cp.returncode == 3)
+    cp = _cli("claim", "http_ok", "--agent", "r4", "--target", "http://127.0.0.1:1/",
+              "--expect", json.dumps({"method": "POST"}))
+    check(f"CLI http_ok POST without allow_unsafe_method -> exit 3 (rc={cp.returncode})",
+          cp.returncode == 3)
+
+    def _big_body(conn, _req, _port):
+        body = b"y" * 100000
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+                     % len(body) + body)
+
+    port, stop = _serve(_big_body)
+    try:
+        obs, v = probe_http_ok(f"http://127.0.0.1:{port}/", {"max_body_bytes": 1024})
+        check("http_ok body over max_body_bytes -> UNVERIFIABLE body_limit_exceeded (was FAIL)",
+              v == UNVERIFIABLE and obs.get("body_limit_exceeded") is True)
+        obs, v = probe_http_ok(f"http://127.0.0.1:{port}/", {"status": 200})
+        check("http_ok same server within cap -> PASS (deadline session works for plain GET)",
+              v == PASS and obs.get("body_bytes") == 100000)
+        obs, v = probe_http_ok(f"http://127.0.0.1:{port}/", {"status": 404})
+        check("http_ok genuine status mismatch is still FAIL", v == FAIL)
+    finally:
+        stop.set()
+    vprobes_doc = vprobes_mod.__doc__ or ""
+    check("probes docstring: FAIL reserved for mismatches; refusals/caps named UNVERIFIABLE",
+          "refusal or a cap is never reported as FAIL" in vprobes_doc
+          and "REFUSED" in vprobes_doc)
+
+    print("== round 4: http_ok total deadline (item 8) ==")
+
+    def _trickle_headers(conn, _req, _port):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n")
+        for i in range(80):  # 8 s of headers, each line well under the 1 s per-read timeout
+            conn.sendall(b"X-Slow-%d: a\r\n" % i)
+            _time.sleep(0.1)
+        conn.sendall(b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+
+    port, stop = _serve(_trickle_headers)
+    try:
+        t0 = _time.monotonic()
+        obs, v = probe_http_ok(f"http://127.0.0.1:{port}/", {"timeout_s": 1})
+        el = _time.monotonic() - t0
+    finally:
+        stop.set()
+    check(f"http_ok trickled HEADERS aborted at total deadline ({el:.1f}s, timeout_s=1; "
+          "was 13.6s)", v == UNVERIFIABLE and obs.get("timed_out") is True and el < 3)
+
+    def _redirects(delay, hops):
+        def _h(conn, req_line, port_):
+            try:
+                k = int(req_line.split(" ")[1].rsplit("/", 1)[-1])
+            except (IndexError, ValueError):
+                k = 0
+            if k < hops:
+                _time.sleep(delay)
+                conn.sendall(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/hop/%d\r\n"
+                             b"Content-Length: 0\r\nConnection: close\r\n\r\n" % (port_, k + 1))
+            else:
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                             b"Connection: close\r\n\r\ndone")
+        return _h
+
+    port, stop = _serve(_redirects(0.5, 8))
+    try:
+        t0 = _time.monotonic()
+        obs, v = probe_http_ok(f"http://127.0.0.1:{port}/hop/0", {"timeout_s": 1})
+        el = _time.monotonic() - t0
+    finally:
+        stop.set()
+    check(f"http_ok 8 slow redirects aborted at total deadline ({el:.1f}s, timeout_s=1; "
+          "was 4.5s)", v == UNVERIFIABLE and obs.get("timed_out") is True and el < 3)
+    port, stop = _serve(_redirects(0.0, 8))
+    try:
+        obs, v = probe_http_ok(f"http://127.0.0.1:{port}/hop/0",
+                               {"timeout_s": 10, "body_contains": "done"})
+    finally:
+        stop.set()
+    check("http_ok fast 8-hop redirect chain still followed -> PASS (final_url = last hop)",
+          v == PASS and str(obs.get("final_url", "")).endswith("/hop/8"))
+
+    print("== round 4: repair-note visibility + strict gate (items 6, 7) ==")
+
+    def _tear_last(agent, cut=40):
+        p_ = r2_store._path(agent)
+        data = p_.read_bytes().rstrip(b"\n")
+        p_.write_bytes(data[:-cut])  # clip the newest receipt mid-line
+
+    big = json.dumps({"min_bytes": 10 ** 9})
+    check("clip: PASS claim", _cli("claim", "file_exists", "--agent", "clip", "--target",
+                                   str(f), "--expect", "{}").returncode == 0)
+    ck0 = _cli("checkpoint", "--agent", "clip", "--json")
+    check("clip: FAIL claim", _cli("claim", "file_exists", "--agent", "clip", "--target",
+                                   str(f), "--expect", big).returncode == 1)
+    ck1 = json.loads(_cli("checkpoint", "--agent", "clip", "--json").stdout)
+    _tear_last("clip")
+    rp = _cli("repair", "--agent", "clip")
+    check("clip: repair of the clipped FAIL succeeds", rp.returncode == 0
+          and json.loads(ck0.stdout)["count"] == 1)
+    au = _cli("audit", "--agent", "clip")
+    check("plain audit after repair: still exit 0 but prints a prominent repair-note "
+          "WARNING (was silent 'chain intact')",
+          au.returncode == 0 and "WARNING: 1 repair note" in au.stdout
+          and "may have been a FAIL" in au.stdout and ".torn" in au.stdout
+          and "see WARNING above" in au.stdout)
+    au_c = _cli("audit", "--agent", "clip", "--expect-count", str(ck1["count"]))
+    check("audit --expect-count after repair: count still matches, but output says "
+          "count-only anchoring is NOT sufficient",
+          au_c.returncode == 0 and "NOT sufficient" in au_c.stdout
+          and "WARNING: 1 repair note" in au_c.stdout)
+    au_h = _cli("audit", "--agent", "clip", "--expect-head", ck1["head"])
+    check("audit --expect-head after repair -> exit 1 head mismatch",
+          au_h.returncode == 1 and "head mismatch" in au_h.stdout)
+    clip_chain = str(r2_store._path("clip"))
+    vr_c = run_vr("--chain", "--agent", "clip", clip_chain)
+    check("verify_receipt --chain lists the repair note separately with a WARNING",
+          vr_c.returncode == 0 and "repair notes: 1" in vr_c.stdout
+          and "WARNING" in vr_c.stdout
+          and "verdicts: 1 PASS, 0 FAIL, 0 UNVERIFIABLE" in vr_c.stdout)
+    vr_g = run_vr("--chain", "--agent", "clip", "--require-verdict", "PASS", clip_chain)
+    check(f"--chain --require-verdict PASS after one repair -> exit 0, not a permanent 3 "
+          f"(rc={vr_g.returncode})",
+          vr_g.returncode == 0 and "verdict requirement (PASS): met" in vr_g.stdout
+          and "repair notes: 1" in vr_g.stdout)
+    check("clip: FAIL claim after repair",
+          _cli("claim", "file_exists", "--agent", "clip", "--target", str(f),
+               "--expect", big).returncode == 1)
+    vr_g2 = run_vr("--chain", "--agent", "clip", "--require-verdict", "PASS", clip_chain)
+    check("strict gate still catches a REAL FAIL after a repair (exit 1)",
+          vr_g2.returncode == 1)
+    rn = sign_receipt(receipt_body(str(uuid_mod.uuid4()), "only-notes", "repair_note",
+                                   "chain_x.jsonl", {}, {"action": "torn_tail_moved_to_sidecar"},
+                                   "UNVERIFIABLE", GENESIS_HASH), cli_priv)
+    p_only = write_lines("only_notes.jsonl", [json.dumps(rn)])
+    vr_o = run_vr("--chain", "--require-verdict", "PASS", p_only)
+    check("chain of ONLY repair notes never meets --require-verdict (exit 1)",
+          vr_o.returncode == 1 and "only repair notes" in vr_o.stdout)
+    fake_note = dict(rn, kind="repair_note", verdict="PASS")
+    check("core and standalone agree on what a repair note is "
+          "(kind repair_note AND verdict UNVERIFIABLE)",
+          vcore.is_repair_note(rn) and vr.is_repair_note(rn)
+          and not vcore.is_repair_note(fake_note) and not vr.is_repair_note(fake_note))
+
+    print("== round 4: migration check needs the actual key file (item 11) ==")
+    ucwd = tmp / "unrelated_cwd"
+    (ucwd / "data" / "keys").mkdir(parents=True)
+    (ucwd / "data" / "keys" / "id_rsa.pub").write_text("ssh-rsa AAAA unrelated", encoding="utf-8")
+    uhome = tmp / "fresh_user_home"
+    uhome.mkdir()
+    uenv = {k_: v_ for k_, v_ in os.environ.items() if k_ != "VERIEFFECT_HOME"}
+    uenv.update(HOME=str(uhome), USERPROFILE=str(uhome), PYTHONPATH=str(ROOT))
+    cpu_ = subprocess.run(
+        [PY, "-m", "verieffect.cli", "claim", "file_exists", "--agent", "fresh",
+         "--target", str(f), "--expect", "{}"],
+        capture_output=True, text=True, cwd=str(ucwd), env=uenv,
+        encoding="utf-8", errors="replace")
+    check(f"unrelated ./data/keys folder does NOT block a new user's first claim "
+          f"(rc={cpu_.returncode})",
+          cpu_.returncode == 0 and "NOTICE" not in cpu_.stderr
+          and (uhome / ".verieffect" / "keys" / "verieffect_ed25519.pem").exists())
+
+    print("== round 4: version + docs (items 3, 4, 5, 12) ==")
+    check("version 0.2.0a1 in pyproject and __init__",
+          'version = "0.2.0a1"' in pyproj and verieffect.__version__ == "0.2.0a1")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    check("README has no stale data/keys pubkey path",
+          "--pubkey data/keys" not in readme)
+    check("README Attestroot license is 'MIT (Pre-Alpha)'",
+          "| MIT (Pre-Alpha) |" in readme and "Pre-Alpha (per PyPI)" not in readme)
+    check("README no longer says receipts can't be forged",
+          "can't be\n  forged" not in readme and "can't be forged" not in readme
+          and "altered without the key" in readme)
+    check("CHANGELOG has a v0.2.0a1 section with review round 4",
+          "## v0.2.0a1" in changelog and "Review round 4" in changelog)
+    check("docs say count-only anchoring is not sufficient",
+          "not sufficient" in readme
+          and "not sufficient" in (ROOT / "docs" / "receipt-schema.md").read_text(encoding="utf-8"))
 
 
 def main():
