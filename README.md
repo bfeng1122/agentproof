@@ -83,8 +83,12 @@ research literature:
   "done," the system of record says otherwise.
 - **OverclaimBench** (arXiv:2609.20812): **80.4% of incomplete runs** were reported in
   a misleading way — 52.8% explicit overclaims plus 27.5% that omitted the gap, so
-  omissions are included in the figure. Coverage is measured deterministically
-  (unique lines entering context).
+  omissions are included in the figure. Coverage (which files entered the agent's
+  context) is measured deterministically, but the admission/omission/overclaim
+  classification of incomplete runs is made by an **LLM judge** (Claude Opus 4.8; the
+  paper reports 91.1% unanimous verdicts across 8 re-judgments, disagreements
+  concentrated on the overclaim/omission boundary — not on the misleading-vs-admission
+  line that carries the headline).
 - **["The Completion Illusion: Why AI Agents Overclaim Done, and the Case for an Agent
   Control Tower"](https://labs.iovstudio.kr/en/papers/agent-control-tower)** (Han Kim,
   IOV Labs; a lab study, not peer-reviewed): across 896 verifiable micro-task
@@ -394,7 +398,7 @@ Full details in [receipt-schema.md](https://github.com/bfeng1122/verieffect/blob
 
 MVP (Alpha). 200+ test checks (`python tests/test_all.py` with the venv python, or
 `pytest tests/`; CI runs ubuntu+windows × Python 3.10–3.12). Dogfooded on a 24/7
-paper-trading stack since late Oct 2026 (40+ receipts): fills, portfolio state and
+paper-trading stack since mid-Oct 2026 (45+ receipts): fills, portfolio state and
 backups, plus a deliberate tamper test that breaks the chain as designed.
 Not yet battle-tested by anyone else.
 Roadmap: named operator-owned checks (`verieffect check <name>`), hosted verifier

@@ -1,6 +1,32 @@
 # Changelog
 
-## v0.2.0a2 — 2026-11-05 (not yet tagged)
+## v0.2.0a3 — 2026-11-05 (tagged v0.2.0a3)
+
+Docs-only release from external review round 6. No changes to the receipt format,
+verdict semantics, exit codes, or any probe behavior — the shipped code is identical
+to 0.2.0a2 except for the version string.
+
+- **OverclaimBench citation corrected (this was wrong in a2).** a2 said "coverage is
+  measured deterministically," which is true of *coverage* but implied the whole 80.4%
+  figure is deterministic. It is not: per the paper's §3.6, an **LLM judge (Claude Opus
+  4.8)** classifies each incomplete run as admission/omission/overclaim, and the 80.4%
+  rests on those judgments. The README now says exactly that — coverage deterministic,
+  classification LLM-judged (91.1% unanimous across 8 re-judgments). Getting this wrong
+  in a project whose thesis is "no LLM in the verdict path" would have been a bad look,
+  and HN checks citations.
+- **Launch drafts removed from the public repo.** `launch/` (show-hn.md, reddit.md) held
+  a rehearsed FAQ crib sheet and "delete before posting" notes. Moved to a private
+  location; they were never meant to ship. The README, not a draft, is the public story.
+- **publish.yml is now tag-only.** Removed `workflow_dispatch`: the tag↔version gate can
+  only run on a tag ref, so a manual dispatch would have skipped it. Tag-only means the
+  gate always runs. (PyPI independently rejects re-uploads of an existing version.)
+- **Changelog date fixes.** v0.2.0a2 is marked tagged; the v0.1.0-alpha entry's date
+  corrected to its actual GitHub Release publish date (2026-11-05).
+- Test suite asserts the corrected OverclaimBench wording, the tag-only workflow, and
+  that `launch/` is absent. 276 checks on POSIX / 275 on Windows (one POSIX-only
+  file-permission check).
+
+## v0.2.0a2 — 2026-11-05 (tagged v0.2.0a2)
 
 Docs and release-pipeline fixes from external review round 5. No changes to the
 receipt format, verdict semantics or exit codes.
@@ -104,9 +130,10 @@ sections below cover the pre-launch hardening rounds.
 - The wheel now ships `verify_receipt.py`. `tests/test_all.py` no longer exits
   at import (pytest-collectable).
 
-## v0.1.0-alpha — 2026-10-31
+## v0.1.0-alpha — 2026-11-05
 
-First tagged release, under the new name.
+First tagged release, under the new name. (Tag and GitHub Release published
+2026-11-05; the underlying rename/hardening work landed late Oct.)
 
 ### Renamed from AgentProof
 "AgentProof" collided with 5+ existing products, including `agent-proof.dev`

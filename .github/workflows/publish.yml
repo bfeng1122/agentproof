@@ -9,16 +9,19 @@
 #     Environment:       (blank — this workflow deliberately has NO `environment:`
 #                         block; the publisher config and the workflow must match)
 #
-# Trigger: push a v* tag (e.g. `git tag v0.2.0a2 && git push origin v0.2.0a2`)
-# or run manually from the Actions tab. The job runs the full test suite first and
-# refuses to publish if the tag (minus a leading "v") != pyproject.toml's version.
+# Trigger: push a v* tag (e.g. `git tag v0.2.0a3 && git push origin v0.2.0a3`).
+# Deliberately NO workflow_dispatch: the tag/version gate below can only run on a
+# tag ref, and a manual-dispatch run would skip it. Publishing is tag-only, so the
+# gate always runs. (PyPI also rejects re-uploads of an existing version, so a
+# stray run could not clobber a release — but tag-only is the honest guarantee.)
+# The job runs the full test suite first and refuses to publish if the tag (minus
+# a leading "v") != pyproject.toml's version.
 
 name: Publish to PyPI
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: read

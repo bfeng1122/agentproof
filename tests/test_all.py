@@ -1646,8 +1646,8 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
           and (uhome / ".verieffect" / "keys" / "verieffect_ed25519.pem").exists())
 
     print("== round 4: version + docs (items 3, 4, 5, 12) ==")
-    check("version 0.2.0a2 in pyproject and __init__",
-          'version = "0.2.0a2"' in pyproj and verieffect.__version__ == "0.2.0a2")
+    check("version 0.2.0a3 in pyproject and __init__",
+          'version = "0.2.0a3"' in pyproj and verieffect.__version__ == "0.2.0a3")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     check("README has no stale data/keys pubkey path",
@@ -1685,9 +1685,9 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
     # word `environment:` while explaining the block is deliberately absent, so a
     # naive substring test false-fails. Strip comment lines before checking.
     pub_code = "\n".join(l for l in pub.splitlines() if not l.lstrip().startswith("#"))
-    check("publish.yml: no environment block, keeps id-token, v* tags + dispatch",
+    check("publish.yml: no environment block, keeps id-token, tag-only trigger (no dispatch)",
           "environment:" not in pub_code and "id-token: write" in pub_code
-          and 'tags: ["v*"]' in pub_code and "workflow_dispatch:" in pub_code)
+          and 'tags: ["v*"]' in pub_code and "workflow_dispatch" not in pub_code)
     check("publish.yml: tests run before build, tag/version gate present",
           0 <= pub.find("tests/test_all.py") < pub.find("python -m build")
           and pub.find("does not match") < pub.find("python -m build")
@@ -1695,9 +1695,10 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
     check("CHANGELOG: v0.2.0a2 section, v0.2.0a1 marked tagged",
           "## v0.2.0a2" in changelog and "(tagged v0.2.0a1)" in changelog
           and "## v0.2.0a1 — 2026-11-05 (not yet tagged)" not in changelog)
-    check("citations: OverclaimBench split, deterministic coverage, no LLM-judge claim",
+    check("citations: OverclaimBench split disclosed AND LLM-judge classification stated",
           "52.8% explicit overclaims" in readme and "27.5%" in readme
-          and "deterministically" in readme and "LLM judge" not in readme)
+          and "deterministically" in readme and "LLM judge" in readme
+          and "Claude Opus 4.8" in readme)
     check("citations: LIMBO setup + CI qualifier",
           "1,279" in readme and "95% CI 78–96%" in readme)
     check("citations: Completion Illusion full title, author, link",
@@ -1706,6 +1707,22 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
           and "https://labs.iovstudio.kr/en/papers/agent-control-tower" in readme)
     archive = (ROOT / "docs" / "archive" / "original-mvp-spec.md").read_text(encoding="utf-8")
     check("archived spec 26% line carries OUTDATED note", "[OUTDATED wording" in archive)
+
+    print("== round 6: OverclaimBench judge honesty, launch/ untracked, tag-only publish ==")
+    # The 80.4% figure rests on an LLM judge (paper §3.6). README must NOT imply the
+    # whole pipeline is deterministic — that would contradict our own "no LLM in the
+    # verdict path" thesis. Coverage deterministic + judge classification both stated.
+    oc = readme.split("OverclaimBench", 1)[1].split("- **[", 1)[0]
+    check("OverclaimBench para states coverage is deterministic but classification uses an LLM judge",
+          "deterministically" in oc and "LLM judge" in oc and "Claude Opus 4.8" in oc
+          and "91.1%" in oc)
+    check("launch/ drafts are NOT tracked in the repo",
+          not (ROOT / "launch").exists())
+    check("publish.yml is tag-only (no manual dispatch that would skip the version gate)",
+          "workflow_dispatch" not in pub_code)
+    check("CHANGELOG v0.2.0a3 present, v0.2.0a2 marked tagged, no stale 'not yet tagged'",
+          "## v0.2.0a3" in changelog and "(tagged v0.2.0a2)" in changelog
+          and "not yet tagged" not in changelog)
 
 
 def main():
