@@ -119,6 +119,63 @@ def canonical_json(obj: Any) -> bytes:
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
+BYTES_HEX_CAP = 4096  # hex chars kept for bytes values (= 2 KiB of raw data)
+
+
+def json_safe(obj: Any) -> Any:
+    """Convert a probe's output into something canonical_json accepts.
+
+    Probe data comes from systems the claimer may control (SQLite BLOBs,
+    `9e999` -> inf, NaN in a JSON document, odd dict keys). If any of it were
+    allowed to make signing raise, NO receipt would be written — data could
+    suppress evidence of a failed check. So every value is normalized first:
+      bytes/bytearray/memoryview -> {"_bytes_hex": <hex, capped>, "_bytes_len": n,
+                                     "_bytes_sha256": <of full value>,
+                                     ["_bytes_truncated": true]}
+      inf / -inf / nan           -> "_nonfinite:inf" / "_nonfinite:-inf" / "_nonfinite:nan"
+      tuple/list/set             -> list (sets sorted by str for determinism)
+      non-str dict keys          -> str(key)
+      strings not encodable as UTF-8 (lone surrogates) -> backslash-escaped
+      anything else unknown      -> str(value)
+    JSON-native values pass through unchanged, so already-safe data is
+    byte-identical after conversion.
+    """
+    if obj is None or isinstance(obj, (bool, int)):
+        return obj
+    if isinstance(obj, float):
+        if obj != obj:
+            return "_nonfinite:nan"
+        if obj in (float("inf"), float("-inf")):
+            return "_nonfinite:" + ("inf" if obj > 0 else "-inf")
+        return obj
+    if isinstance(obj, str):
+        try:
+            obj.encode("utf-8")
+            return obj
+        except UnicodeEncodeError:
+            return obj.encode("utf-8", "backslashreplace").decode("utf-8")
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        raw = bytes(obj)
+        hx = raw.hex()
+        out: dict[str, Any] = {"_bytes_hex": hx[:BYTES_HEX_CAP],
+                               "_bytes_len": len(raw),
+                               "_bytes_sha256": sha256_hex(raw)}
+        if len(hx) > BYTES_HEX_CAP:
+            out["_bytes_truncated"] = True
+        return out
+    if isinstance(obj, dict):
+        return {json_safe(k if isinstance(k, str) else str(k)): json_safe(v)
+                for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(x) for x in obj]
+    if isinstance(obj, (set, frozenset)):
+        return [json_safe(x) for x in sorted(obj, key=str)]
+    try:
+        return json_safe(str(obj))
+    except Exception:  # noqa: BLE001 — a hostile __str__ must not block the receipt
+        return f"<unserializable {type(obj).__name__}>"
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -377,15 +434,19 @@ def _file_lock(path: Path, timeout_s: float = LOCK_TIMEOUT_S):
 def receipt_body(claim_id: str, agent_id: str, kind: str, target: Any,
                  expect: Any, observed: Any, verdict: str,
                  prev_hash: str) -> dict:
-    """The signed payload — everything except `sig`."""
+    """The signed payload — everything except `sig`.
+
+    target/expect/observed are passed through json_safe() so probe data can
+    never make signing raise (which would suppress the receipt entirely).
+    """
     return {
         "v": SCHEMA_VERSION,
         "claim_id": claim_id,
         "agent_id": agent_id,
         "kind": kind,
-        "target": target,
-        "expect": expect,
-        "observed": observed,
+        "target": json_safe(target),
+        "expect": json_safe(expect),
+        "observed": json_safe(observed),
         "verdict": verdict,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "prev_receipt_hash": prev_hash,

@@ -105,15 +105,37 @@ Chain (audit):
   32 MiB): exceeding it FAILs with `observed.body_limit_exceeded` and the
   connection is closed — the verifier's memory is never at the mercy of the
   target.
-- `exit_code` is gated OFF by default (`allow_shell: true` required). It is NOT
+- `exit_code` is gated OFF by default (`allow_shell: true` required — but see
+  Known limitations: the gate is part of the claim payload). It is NOT
   sandboxed: the command runs with the verifier's full OS privileges. Bounds are a
-  hard timeout (default 30 s), no stdin, and STREAMING output capture with a hard
-  byte cap (`max_output_bytes`, default 64 MiB): stdout is hashed and counted
-  chunk-by-chunk with only a 1 KiB head excerpt buffered; exceeding the cap kills
-  the process (whole process group on POSIX) and FAILs with
-  `observed.output_limit_exceeded`. On timeout the process group is killed, not
-  just the shell. Stdout/stderr excerpts are stored in the signed
-  receipt — never run commands that print secrets.
+  hard timeout (default 30 s; `timeout_s` that is `null`, non-numeric, non-finite
+  or ≤ 0 is rejected as `UNVERIFIABLE` rather than meaning "wait forever"), no
+  stdin, and STREAMING output capture with a hard byte cap (`max_output_bytes`,
+  default 64 MiB): stdout is hashed and counted chunk-by-chunk with only a 1 KiB
+  head excerpt buffered; exceeding the cap FAILs with
+  `observed.output_limit_exceeded`. On timeout, output cap, and normal exit the
+  process **tree** is killed, not just the shell:
+  - **POSIX:** the command runs in its own session; the whole process group is
+    `SIGKILL`ed, including background children left behind after a normal exit.
+  - **Windows:** `taskkill /T /F /PID <shell>` kills `cmd.exe` and its
+    descendants while the shell is still alive (timeout / output cap). After a
+    *normal* exit, a `taskkill /T` is still attempted, but children that outlived
+    `cmd.exe` are orphaned (no live parent links to them), so assume they
+    **survive**. A Job Object would close this gap and is on the roadmap.
+
+  Stdout/stderr excerpts are stored in the signed receipt — never run commands
+  that print secrets.
+- `http_ok` likewise rejects an invalid `timeout_s` as `UNVERIFIABLE`.
+- Unserializable probe data never suppresses a receipt. Before signing,
+  `expect` and `observed` are normalized to JSON-safe forms: bytes (e.g. a
+  SQLite BLOB) become `{"_bytes_hex", "_bytes_len", "_bytes_sha256"}` (hex capped
+  at 4096 chars, `"_bytes_truncated": true` when cut), non-finite floats become
+  the strings `"_nonfinite:inf"` / `"_nonfinite:-inf"` / `"_nonfinite:nan"`, and
+  anything else unknown becomes its `str()`. A probe that crashes outright yields
+  an `UNVERIFIABLE` receipt with `observed.error`.
+- `file_exists` with `modified_within_s` FAILs when the file's mtime is more than
+  60 s in the future (`observed.mtime_future: true`) — otherwise a future-dated
+  file would satisfy "modified recently" forever.
 - `exit_code` RE-RUNS the command at verify time; it does not observe the claimer's
   original execution. A receipt therefore attests "this command exits N *now*," not
   "the agent's run exited N." Use it only for idempotent checks; verify side-effecting
@@ -151,6 +173,42 @@ chain is audited with `--agent`) belongs to the claimed agent.
    receipts. A `kid` field is additive within v1 and on the roadmap.
 7. **Network position.** `http_ok` fetches from the verifier's network — treat it
    as an SSRF/content-oracle surface; only wire claims from trusted claimers.
+   (Details under Known limitations, H3.)
+
+### Known limitations — fix gated on the MCP roadmap
+
+Today every claim comes from the operator's own CLI or scripts, so whoever writes
+a claim already has the operator's privileges. An MCP server would let *agents*
+submit `target`/`expect` directly, and the three items below would then become
+exploitable. Each one has to be fixed before the MCP server ships. Until then,
+only accept claims from callers you would also trust with a shell as the
+verifier's OS user.
+
+- **H1 — the opt-in gates are part of the claim.** `allow_shell` (`exit_code`)
+  and `allow_unsafe_method` (`http_ok`) are keys inside `expect`, so whoever
+  writes the claim can set them. They are warning labels that stop accidental
+  use; they are **not a security boundary**. Planned: move them to operator
+  configuration (`VERIEFFECT_HOME` config / environment), add command and URL
+  allowlists, and keep recording the effective policy in the receipt.
+- **H2 — probes can read any file the verifier can read.** `file_exists`,
+  `db_row_matches` (json/jsonl/sqlite) have no path restriction. Values are
+  echoed into the signed receipt (`match_results[*].observed`, up to 50 SQLite
+  rows), and `contains` is a yes/no oracle on arbitrary file content. Together
+  they work as a **data-extraction oracle**. That includes the verifier's own
+  signing key under `VERIEFFECT_HOME`, which can be recovered with a few
+  thousand `contains` guesses. Planned: operator-configured allowed roots
+  (checked on the resolved real path, UNC/device paths rejected), a hard deny
+  on `VERIEFFECT_HOME`, and hashes instead of verbatim values by default.
+- **H3 — `http_ok` has no SSRF filtering.** It does not filter hosts or IPs, so
+  loopback, RFC 1918, link-local and cloud-metadata addresses are all reachable.
+  Redirects are followed by default. `final_url_matches_target` is checked only
+  after the request has landed, and `body_contains_found` is still recorded when
+  that check fails, so the content oracle survives a redirect to an internal
+  address. Error strings also tell refused, timed-out and answered ports apart.
+  Planned: default-deny private, loopback, link-local, CGNAT, ULA and mapped IP
+  ranges, checked against the address actually connected to; re-validating
+  every redirect hop; suppressing `body_contains_found` on a final-URL mismatch;
+  and reducing errors to categories.
 
 ## Versioning
 

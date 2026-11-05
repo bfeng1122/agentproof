@@ -64,23 +64,40 @@ def cmd_claim(args: argparse.Namespace) -> int:
     # exit_code) and holding the chain lock that long starves other claimers
     # into timeout. The critical section is only: read prev-hash → sign →
     # append, which is milliseconds.
-    observed, verdict = PROBES[args.kind](args.target, expect)
+    # A probe crash (malformed expect, unexpected data) must still produce a
+    # receipt — never a traceback with no evidence written.
+    try:
+        observed, verdict = PROBES[args.kind](args.target, expect)
+    except Exception as e:  # noqa: BLE001
+        observed = {"error": f"probe crashed: {type(e).__name__}: {e}"}
+        verdict = "UNVERIFIABLE"
 
     # lock the whole read-last-hash → append cycle: concurrent claims must
     # serialize or they fork the chain (both would read the same prev hash)
     try:
         with store.transaction(args.agent):
-            body = receipt_body(
-                claim_id=str(uuid.uuid4()),
-                agent_id=args.agent,
-                kind=args.kind,
-                target=args.target,
-                expect=expect,
-                observed=observed,
-                verdict=verdict,
-                prev_hash=store.last_hash(args.agent),
-            )
-            receipt = sign_receipt(body, priv)
+            prev_hash = store.last_hash(args.agent)
+            claim_id = str(uuid.uuid4())
+            try:
+                # receipt_body json_safe()s expect/observed (bytes, inf/nan, ...)
+                body = receipt_body(claim_id=claim_id, agent_id=args.agent,
+                                    kind=args.kind, target=args.target,
+                                    expect=expect, observed=observed,
+                                    verdict=verdict, prev_hash=prev_hash)
+                receipt = sign_receipt(body, priv)
+            except (TypeError, ValueError, RecursionError) as e:
+                # last resort (e.g. pathologically deep nesting): keep the
+                # receipt, drop the evidence. A PASS without recordable
+                # evidence is downgraded — never silently kept.
+                if verdict == "PASS":
+                    verdict = "UNVERIFIABLE"
+                body = receipt_body(
+                    claim_id=claim_id, agent_id=args.agent, kind=args.kind,
+                    target=args.target, expect={"_unserializable": True},
+                    observed={"error": "observed/expect could not be serialized: "
+                                       f"{type(e).__name__}"},
+                    verdict=verdict, prev_hash=prev_hash)
+                receipt = sign_receipt(body, priv)
             store.append(receipt)
     except RuntimeError as e:
         # structured error from a corrupt chain tail — match audit's behavior

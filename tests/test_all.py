@@ -106,6 +106,15 @@ with tempfile.TemporaryDirectory() as tmp:
     check("modified_before past cutoff -> FAIL", v == FAIL)
     obs, v = probe_file_exists(str(f), {"modified_after": "not-a-date"})
     check("modified_after garbage -> UNVERIFIABLE", v == UNVERIFIABLE)
+    # L3: a future mtime must not satisfy modified_within_s forever
+    fut = tmp / "future.txt"
+    fut.write_text("x", encoding="utf-8")
+    os.utime(fut, (4102444800, 4102444800))  # 2100-01-01
+    obs, v = probe_file_exists(str(fut), {"modified_within_s": 60})
+    obs_now, v_now = probe_file_exists(str(f), {"modified_within_s": 3600})
+    check("future mtime (2100) + modified_within_s -> FAIL with mtime_future; fresh file still PASS",
+          v == FAIL and obs.get("mtime_future") is True
+          and v_now == PASS and "mtime_future" not in obs_now)
 
     print("== probe: http_ok ==")
     obs, v = probe_http_ok("https://example.com/", {"status": 200})
@@ -205,6 +214,59 @@ with tempfile.TemporaryDirectory() as tmp:
     obs, v = probe_exit_code(f'"{PY}" -c "import time; time.sleep(30)"',
                              {**SHELL_OK, "timeout_s": 2})
     check("timeout -> FAIL with timed_out flag", v == FAIL and obs.get("timed_out") is True)
+
+    # M2: timeout must kill the whole tree, not just the shell
+    import time as _time
+
+    def _count_child(marker):
+        """Number of live processes matching the probe child, or None if the
+        platform has no usable process lister (test is then skipped)."""
+        try:
+            if os.name == "nt":
+                out = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq PING.EXE", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=20).stdout
+                return sum(1 for ln in out.splitlines() if "PING.EXE" in ln.upper())
+            cpg = subprocess.run(["pgrep", "-f", marker], capture_output=True,
+                                 text=True, timeout=20)
+            if cpg.returncode not in (0, 1):
+                return None
+            return len([ln for ln in cpg.stdout.splitlines() if ln.strip()])
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    if os.name == "nt":
+        orphan_cmd, orphan_marker = "ping -n 15 127.0.0.1 >nul", "PING.EXE"
+    else:
+        orphan_cmd, orphan_marker = "sleep 15.731", "sleep 15.731"
+    n_before = _count_child(orphan_marker)
+    if n_before is None:
+        print("  SKIP timeout kills child process tree (no tasklist/pgrep)")
+    else:
+        obs, v = probe_exit_code(orphan_cmd, {**SHELL_OK, "timeout_s": 2})
+        n_after = _count_child(orphan_marker)
+        deadline = _time.monotonic() + 5  # TerminateProcess/SIGKILL are async
+        while n_after is not None and n_after > n_before and _time.monotonic() < deadline:
+            _time.sleep(0.25)
+            n_after = _count_child(orphan_marker)
+        check(f"timeout kills child process tree, not just the shell "
+              f"({orphan_marker}: {n_before} before, {n_after} after)",
+              v == FAIL and obs.get("timed_out") is True
+              and n_after is not None and n_after <= n_before)
+
+    # M1/M2: unbounded / garbage timeout_s is refused, never 'wait forever'
+    bad_timeouts = [None, "5", 0, -1, True, float("inf")]
+    ec_bad = [probe_exit_code(f'"{PY}" -c "print(1)"', {**SHELL_OK, "timeout_s": t})
+              for t in bad_timeouts]
+    check("exit_code: timeout_s None/str/0/-1/bool/inf -> UNVERIFIABLE with reason",
+          all(v == UNVERIFIABLE and "timeout_s" in str(o.get("error", ""))
+              for o, v in ec_bad))
+    http_bad = [probe_http_ok("http://127.0.0.1:1/", {"timeout_s": t}) for t in bad_timeouts]
+    check("http_ok: timeout_s None/str/0/-1/bool/inf -> UNVERIFIABLE with reason",
+          all(v == UNVERIFIABLE and "timeout_s" in str(o.get("error", ""))
+              for o, v in http_bad))
+    obs, v = probe_exit_code(f'"{PY}" -c "print(1)"', {**SHELL_OK, "timeout_s": 10.5})
+    check("exit_code: valid float timeout_s still runs", v == PASS)
     obs, v = probe_exit_code(f'"{PY}" -c "print(\'x\')"',
                              {**SHELL_OK, "stdout_sha256": "0" * 64})
     check("wrong stdout_sha256 -> FAIL", v == FAIL)
@@ -313,6 +375,61 @@ with tempfile.TemporaryDirectory() as tmp:
          "--expect", '{"min_bytes": NaN}'],
         capture_output=True, text=True, cwd=str(ROOT), env=env)
     check("NaN in --expect rejected with exit 2", cp7.returncode == 2)
+
+    # --- L2: unserializable observed (SQLite BLOB, inf) must still yield a receipt ---
+    blob_db = tmp / "blob.db"
+    _bc = sqlite3.connect(str(blob_db))
+    _bc.execute("CREATE TABLE b (data BLOB, big BLOB)")
+    _bc.execute("INSERT INTO b VALUES (x'00ff10', randomblob(5000))")
+    _bc.commit(); _bc.close()
+    # 9e999 parses as float('inf') in --expect too (json.loads accepts it)
+    cp_blob = subprocess.run(
+        [PY, "-m", "verieffect.cli", "claim", "db_row_matches",
+         "--agent", "blob-agent", "--target", f"sqlite:///{blob_db.as_posix()}",
+         "--expect", '{"query": "SELECT data, big, 9e999 FROM b", "rows": [[1]], "junk": 9e999}',
+         "--out", str(tmp / "blob_receipt.json")],
+        capture_output=True, text=True, cwd=str(ROOT), env=env)
+    blob_rec = {}
+    try:
+        blob_rec = json.loads((tmp / "blob_receipt.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    row0 = (blob_rec.get("observed", {}).get("rows") or [[None, None, None]])[0]
+    check("BLOB row: FAIL receipt written (exit 1, no traceback)",
+          cp_blob.returncode == 1 and "Traceback" not in cp_blob.stderr
+          and blob_rec.get("verdict") == "FAIL")
+    check("BLOB row: bytes -> _bytes_hex, inf -> _nonfinite marker (observed + expect)",
+          isinstance(row0[0], dict) and row0[0].get("_bytes_hex") == "00ff10"
+          and row0[0].get("_bytes_len") == 3
+          and isinstance(row0[1], dict) and row0[1].get("_bytes_truncated") is True
+          and len(row0[1].get("_bytes_hex", "")) == 4096 and row0[1].get("_bytes_len") == 5000
+          and row0[2] == "_nonfinite:inf"
+          and blob_rec.get("expect", {}).get("junk") == "_nonfinite:inf")
+    cp_blob_v = subprocess.run(
+        [PY, str(ROOT / "verify_receipt.py"),
+         "--pubkey", str(tmp / "cli_home" / "keys" / "verieffect_ed25519.pub"),
+         str(tmp / "blob_receipt.json")],
+        capture_output=True, text=True, cwd=str(ROOT))
+    cp_blob_a = subprocess.run(
+        [PY, "-m", "verieffect.cli", "audit", "--agent", "blob-agent"],
+        capture_output=True, text=True, cwd=str(ROOT), env=env)
+    check("BLOB receipt verifies offline (verify_receipt.py) and chain audits clean",
+          cp_blob_v.returncode == 0 and "VALID" in cp_blob_v.stdout
+          and cp_blob_a.returncode == 0)
+    # NaN inside a JSON document + a missing dotted path (_MISSING sentinel)
+    nan_doc = tmp / "nan_doc.json"
+    nan_doc.write_text('{"a": NaN}', encoding="utf-8")
+    obs, v = probe_db_row_matches(str(nan_doc), {"fields": {"a": 1, "no.such": 1}})
+    try:
+        r_nan = sign_receipt(receipt_body(str(uuid_mod.uuid4()), "nan", "db_row_matches",
+                                          str(nan_doc), {}, obs, v, GENESIS_HASH), priv)
+        ok_nan, _ = verify_receipt(r_nan, pub_pem)
+        mr = r_nan["observed"]["match_results"]
+        check("NaN doc value + missing path: signed receipt, deterministic markers",
+              ok_nan and v == FAIL and mr["a"]["observed"] == "_nonfinite:nan"
+              and mr["no.such"]["observed"] == "<missing>")
+    except Exception as e:  # noqa: BLE001
+        check(f"NaN doc value + missing path: signed receipt (raised {e!r})", False)
 
     # --- http_ok refuses non-GET/HEAD methods by default (M3 partial) ---
     obs, v = probe_http_ok("http://127.0.0.1:1/", {"method": "DELETE"})

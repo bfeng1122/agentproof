@@ -20,6 +20,24 @@ from typing import Any
 
 PASS, FAIL, UNVERIFIABLE = "PASS", "FAIL", "UNVERIFIABLE"
 
+MTIME_FUTURE_SKEW_S = 60  # clock-skew allowance before a future mtime FAILs
+
+
+def _timeout_from(expect: dict[str, Any], default: float) -> tuple[float | None, str | None]:
+    """Validate expect.timeout_s. Returns (timeout, None) or (None, error).
+
+    None / non-numeric / bool / non-finite / <= 0 are rejected — `None` in
+    particular would otherwise mean "wait forever".
+    """
+    if "timeout_s" not in expect:
+        return default, None
+    t = expect["timeout_s"]
+    if isinstance(t, bool) or not isinstance(t, (int, float)) or t != t \
+            or t in (float("inf"), float("-inf")) or t <= 0:
+        return None, (f"invalid timeout_s {t!r}: must be a finite number > 0 "
+                      "(refusing to run without a bound)")
+    return t, None
+
 
 def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -77,6 +95,11 @@ def probe_file_exists(target: str, expect: dict[str, Any] | None) -> tuple[dict,
         observed["age_s"] = round(age, 1)
         if age > expect["modified_within_s"]:
             verdict = FAIL
+        # a future mtime (touch -d 2100) would make age negative and pass
+        # "modified within N s" forever — beyond clock-skew allowance it FAILs
+        if age < -MTIME_FUTURE_SKEW_S:
+            observed["mtime_future"] = True
+            verdict = FAIL
     if "modified_after" in expect or "modified_before" in expect:
         from datetime import datetime, timezone
 
@@ -127,12 +150,16 @@ def probe_http_ok(target: str, expect: dict[str, Any] | None) -> tuple[dict, str
     """target: URL. expect keys (all optional):
     status (int, default 200), body_contains (str), body_sha256 (str),
     method (GET or HEAD only by default — probes must not mutate; pass
-    "allow_unsafe_method": true to permit others), timeout_s (default 15).
+    "allow_unsafe_method": true to permit others), timeout_s (default 15;
+    must be a finite number > 0).
     Probe performs the request ITSELF — the claimer's reported response is
     never trusted.
-    NOTE: target is fetched from the verifier's network position. Do not wire
-    claims from untrusted claimers — this is an SSRF/content-oracle surface
-    (see docs/receipt-schema.md, Threat Model).
+    KNOWN LIMITATIONS (fix gated on the MCP roadmap): target is fetched from
+    the verifier's network position with NO host/IP filtering; redirects are
+    followed by default; body_contains_found is recorded even when
+    final_url_matches_target fails; allow_unsafe_method is a claim-payload
+    gate, not a security boundary. Do not wire claims from untrusted
+    claimers — see docs/receipt-schema.md, Threat Model.
     """
     expect = expect or {}
     try:
@@ -144,7 +171,9 @@ def probe_http_ok(target: str, expect: dict[str, Any] | None) -> tuple[dict, str
     if method not in ("GET", "HEAD") and not expect.get("allow_unsafe_method"):
         return {"error": f"method {method} refused — pass allow_unsafe_method "
                          "to permit non-read-only requests"}, FAIL
-    timeout = expect.get("timeout_s", 15)
+    timeout, terr = _timeout_from(expect, 15)
+    if terr:
+        return {"url": target, "method": method, "error": terr}, UNVERIFIABLE
     # redirect policy: followed by default, but strict claims can pin the
     # destination — "final_url_matches_target" fails if a redirect chain ends
     # anywhere other than the exact target URL
@@ -380,7 +409,18 @@ def probe_db_row_matches(target: str, expect: dict[str, Any] | None) -> tuple[di
     return observed, verdict
 
 
-_MISSING = object()
+class _Missing:
+    """Sentinel for an absent path. Deterministic repr so it serializes
+    stably into receipts (via json_safe -> str) instead of an object address."""
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<missing>"
+
+    __str__ = __repr__
+
+
+_MISSING = _Missing()
 
 
 def _get_dotted(doc: Any, path: str) -> Any:
@@ -414,12 +454,17 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
 
     SECURITY: this probe is NOT sandboxed. The command executes with
     verieffect's full OS privileges. It is gated OFF by default: pass
-    "allow_shell": true in --expect (operator-controlled) to run it at all.
-    Only wire claims from agents the operator controls — whoever can submit
-    this claim can execute arbitrary commands on the verifier's machine.
-    Bounds: hard timeout, STREAMING output capture with a hard byte cap
-    (max_output_bytes, default 64MiB — output is never fully buffered),
-    process-group kill on timeout, no stdin.
+    "allow_shell": true in --expect to run it at all. KNOWN LIMITATION: that
+    gate lives in the claim payload, so whoever writes the claim can set it —
+    it is a warning label, not a security boundary, until it moves to
+    operator config (required before the MCP server ships). Only wire claims
+    from agents the operator controls — whoever can submit this claim can
+    execute arbitrary commands on the verifier's machine.
+    Bounds: hard timeout (timeout_s must be a finite number > 0), STREAMING
+    output capture with a hard byte cap (max_output_bytes, default 64MiB —
+    output is never fully buffered), no stdin, and a process-TREE kill on
+    timeout / output cap / normal exit (POSIX: killpg of the probe's own
+    session; Windows: taskkill /T /F — see _kill for the Windows limit).
 
     SEMANTICS: the probe RE-RUNS the command at verify time — it does not
     replay or observe the agent's original execution. Use it only for
@@ -441,23 +486,45 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
         return {"error": "exit_code probe refused — it executes arbitrary "
                          "commands with the verifier's privileges; pass "
                          '"allow_shell": true to opt in (see probe docstring)'}, FAIL
-    timeout = expect.get("timeout_s", 30)
+    timeout, terr = _timeout_from(expect, 30)
+    if terr:
+        return {"command": target, "error": terr}, UNVERIFIABLE
     workdir = expect.get("workdir") or None
     max_out = int(expect.get("max_output_bytes", 64 * 1024 * 1024))
     needle = expect.get("stdout_contains")
     observed: dict[str, Any] = {"command": target, "timeout_s": timeout}
 
     def _kill(p):
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(p.pid), 9)
-            else:
-                p.kill()
-        except OSError:
+        """Kill the whole process tree, not just the shell.
+
+        POSIX: the child is its own session leader (start_new_session), so
+        pgid == p.pid; killpg works even after the leader has been reaped,
+        as long as group members remain.
+        Windows: `taskkill /T` walks the tree by parent PID. Popen keeps the
+        process handle open, so p.pid cannot be recycled while we hold it.
+        LIMIT: once cmd.exe has exited, its orphaned children no longer link
+        to it and /T cannot find them — only a Job Object would (roadmap).
+        """
+        if os.name == "posix":
             try:
-                p.kill()
+                os.killpg(p.pid, 9)
+                return
             except OSError:
                 pass
+        else:
+            try:
+                r = subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                                   stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=10)
+                if r.returncode == 0:
+                    return
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            p.kill()
+        except OSError:
+            pass
 
     kwargs: dict[str, Any] = dict(cwd=workdir, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -518,6 +585,9 @@ def probe_exit_code(target: str, expect: dict[str, Any] | None) -> tuple[dict, s
         for t in threads:
             t.join(timeout=2)
         return observed, FAIL
+    # normal exit: reap anything the command left running in the background
+    # (best effort on Windows — see _kill)
+    _kill(proc)
     for t in threads:
         t.join(timeout=10)
 

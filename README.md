@@ -95,7 +95,7 @@ described the idea or solved adjacent problems:
   file, check the process return code — with a total checker that yields
   "Unverifiable" on malformed input rather than raising. Same core principle and
   several of the same rules as our `file_exists`/`exit_code` probes. It's a short
-  conceptual note; Verieffect is a shipped, tested implementation (118 tests, CI,
+  conceptual note; Verieffect is a shipped, tested implementation (127 tests, CI,
   dogfooded) and adds the packaging that note names as its own gap: sealed
   receipts re-verifiable offline.
 - **[Beyond Approved Actions: Runtime Validation of Persistent Outcomes in Agent Workflows](https://arxiv.org/abs/2609.31301)**
@@ -232,9 +232,13 @@ flowchart LR
 | `exit_code` | shell command | command **re-run at verify time**: exit code / stdout content. **Off by default** (`"allow_shell": true` required); runs with the verifier's full OS privileges. Use only for idempotent/read-only commands — for side-effecting work, verify the *effect* (`file_exists`/`db_row_matches`) instead |
 
 ⚠️ **Trust boundary:** `http_ok` and `exit_code` act on the verifier's machine and
-network position. Only wire claims from agents **you** operate — a claimer who can
-submit an `exit_code` claim can run commands. See the threat model in
-[`docs/receipt-schema.md`](docs/receipt-schema.md).
+network position, and every file-reading probe can read whatever the verifier can.
+Only wire claims from agents **you** operate. A claimer who can submit an `exit_code`
+claim can run commands, because the `allow_shell` / `allow_unsafe_method` gates are
+part of the claim itself. There are three known limitations: claim-payload gates,
+no path restriction (file-read oracle) and no SSRF filtering. Each must be fixed
+before the MCP server ships; see
+[Known limitations](docs/receipt-schema.md#known-limitations--fix-gated-on-the-mcp-roadmap).
 
 ## Offline verification
 
@@ -286,7 +290,8 @@ response).
 2. Anything not provable deterministically is `UNVERIFIABLE`, not `PASS`.
 3. `db_row_matches` is read-only (non-SELECT rejected, `query_only` enforced);
    `http_ok` is read-only by default. The verifier never mutates audited systems
-   unless the operator explicitly opts in (`allow_shell` / `allow_unsafe_method`).
+   unless the claim explicitly opts in (`allow_shell` / `allow_unsafe_method` — today
+   these live in the claim payload, so they guard against accidents, not attackers).
 4. The hash chain is the audit trail — append-only; edits and mid-chain deletions are
    detected by any offline auditor. Anchor the head hash externally (a daily commit,
    an OpenTimestamps stamp, a posted checkpoint) to also detect truncation.
@@ -302,7 +307,7 @@ Full details in [receipt-schema.md](docs/receipt-schema.md).
 
 ## Status
 
-MVP (Alpha). 118-test suite (`python tests/test_all.py` with the venv python; CI runs
+MVP (Alpha). 127-test suite (`python tests/test_all.py` with the venv python; CI runs
 ubuntu+windows × Python 3.10–3.12). Dogfooded for ~2 weeks (since late Oct 2026)
 on the author's own paper-trading agent stack (fills, portfolio state, backups) —
 40+ receipts so far, plus a deliberate tamper test that breaks the chain as designed.
