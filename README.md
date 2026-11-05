@@ -26,7 +26,7 @@ $ verieffect claim file_exists --agent backup-cron \
 }
 $ echo $?
 1
-$ python verify_receipt.py --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
+$ python -m verify_receipt --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
 VALID: ok (claim 830c4620-deb4-4d5e-a4d2-ed83c77f79da, verdict FAIL)
 ```
 (output from a Windows run — observed.path uses backslashes)
@@ -44,7 +44,7 @@ The signed `FAIL` receipt is the evidence, and exit code `1` lets cron alert on 
 > execution** (such an agent could read the key and forge receipts). Verieffect is a
 > *drift detector* for the well-documented "agent says done, side effect didn't
 > happen" failure mode. Hosted/separate-user verification is on the roadmap. Details:
-> [threat model](docs/receipt-schema.md#threat-model-what-receipts-do-and-dont-prove).
+> [threat model](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md#threat-model-what-receipts-do-and-dont-prove).
 
 - **No LLM in the verdict path.** Verdicts come from deterministic probes: filesystem
   state, HTTP responses, database rows, command exit codes. A model never *opines*
@@ -76,14 +76,20 @@ checking the system of record.
 **Agents report failures as success.** The overclaiming evidence comes from the
 research literature:
 
-- **LIMBO** ("Where Does Exactly-Once Live?", arXiv:2609.29095): in **90% of episodes
-  that produced a duplicate side effect, the agent reported the task as completed.**
-  This is the closest published evidence to exactly what Verieffect catches — the
-  self-report says "done," the system of record says otherwise.
+- **LIMBO** ("Where Does Exactly-Once Live?", arXiv:2609.29095): in one experimental
+  setup (E1), of 1,279 episodes that produced a duplicate side effect, **the agent
+  finished with status "completed" in 90% (95% CI 78–96%).** This is the closest
+  published evidence to exactly what Verieffect catches — the self-report says
+  "done," the system of record says otherwise.
 - **OverclaimBench** (arXiv:2609.20812): **80.4% of incomplete runs** were reported in
-  a misleading way.
-- **"The Completion Illusion"** (IOV Labs; a lab study, not peer-reviewed): agents
-  self-reported perfect completion while verified accuracy was 86–96%.
+  a misleading way — 52.8% explicit overclaims plus 27.5% that omitted the gap, so
+  omissions are included in the figure. Coverage is measured deterministically
+  (unique lines entering context).
+- **["The Completion Illusion: Why AI Agents Overclaim Done, and the Case for an Agent
+  Control Tower"](https://labs.iovstudio.kr/en/papers/agent-control-tower)** (Han Kim,
+  IOV Labs; a lab study, not peer-reviewed): across 896 verifiable micro-task
+  instances and 4 models, agents self-reported 100% completion while verified
+  accuracy was 86–96%.
 
 Autonomous agent stacks — cron-driven pipelines, CI bots, personal agents — fail the
 same way: the log says "done," the side effect never happened (or happened twice).
@@ -132,39 +138,40 @@ cron/CI. Implementation and developer experience — not the underlying idea.
 
 ## Quick start
 
-```bash
-pip install verieffect        # from PyPI; gives you the `verieffect` console script
-```
-
-Or from a clone (for contributors):
+Works verbatim from an **empty folder** (bash/zsh; Windows notes below):
 
 ```bash
-python -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt   # Windows: .venv/Scripts/python
-# Optional: `pip install .` also gives you a `verieffect` console script.
+# 0. Install — gives you the `verieffect` console script and the
+#    `verify_receipt` offline-verifier module
+pip install verieffect
+
+# 1. Something for an agent to claim it produced
+echo "hello" > proof.txt
+
+# 2. File a claim — the probe checks the file itself; this PASSES (exit code 0).
+#    The first claim auto-generates your signing key under ~/.verieffect.
+verieffect claim file_exists --agent my-agent --target ./proof.txt --expect '{"min_bytes": 1}' --out receipt.json
+
+# 3. Verify the receipt offline (needs only the public key)
+python -m verify_receipt --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
+
+# 4. Audit the whole chain for that agent
+verieffect audit --agent my-agent
 ```
 
-```bash
-# 1. File a claim — targets a file that ships with the repo, so this PASSES on a
-#    fresh clone (exit code 0). Keys/receipts land under ~/.verieffect (see below).
-.venv/bin/python -m verieffect.cli claim file_exists --agent my-agent \
-  --target ./README.md --expect '{"min_bytes": 1024}' --out receipt.json
-
-# 2. Verify the receipt offline (completes the claim→verify loop)
-.venv/bin/python verify_receipt.py \
-  --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
-
-# 3. Audit the whole chain for that agent
-.venv/bin/python -m verieffect.cli audit --agent my-agent
-```
-
-On Windows, substitute `.venv/Scripts/python` for `.venv/bin/python` throughout.
+Keys and receipt chains live in a per-user directory, `~/.verieffect`
+(Windows: `%USERPROFILE%\.verieffect`) — not in the current folder. Set
+`VERIEFFECT_HOME=/some/path` to put them somewhere else (then pass
+`--pubkey $VERIEFFECT_HOME/keys/verieffect_ed25519.pub` to the verifier). See
+[Where things live](#where-things-live).
 
 > **Windows cmd/PowerShell:** single-quoted JSON doesn't work — use double quotes
-> with escaped inner quotes: `--expect "{\"min_bytes\": 1024}"`, and replace `\`
-> line continuations with `^` (cmd) or a backtick (PowerShell).
+> with escaped inner quotes: `--expect "{\"min_bytes\": 1}"`. Windows PowerShell 5.1
+> does not expand `~` for native commands, so pass the key path as
+> `--pubkey "$HOME\.verieffect\keys\verieffect_ed25519.pub"` (cmd:
+> `--pubkey "%USERPROFILE%\.verieffect\keys\verieffect_ed25519.pub"`).
 
-Output (truncated):
+Output of step 2 (truncated):
 
 ```json
 {
@@ -172,18 +179,35 @@ Output (truncated):
   "claim_id": "…",
   "agent_id": "my-agent",
   "kind": "file_exists",
-  "target": "./README.md",
-  "expect": {"min_bytes": 1024},
-  "observed": {"path": "README.md", "exists": true, "is_dir": false, "is_regular_file": true,
-               "size": 4096, "mtime": 1792090847},
+  "target": "./proof.txt",
+  "expect": {"min_bytes": 1},
+  "observed": {"path": "proof.txt", "exists": true, "is_dir": false, "is_regular_file": true,
+               "size": 6, "mtime": 1793900000},
   "verdict": "PASS",
-  "checked_at": "2026-10-20T23:12:06Z",
+  "checked_at": "2026-11-05T12:00:00Z",
   "prev_receipt_hash": "…",
   "sig": "ed25519:…"
 }
 ```
 
-Exit codes — `claim` (`python -m verieffect.cli claim …`), so shell scripts and
+### From source (contributing)
+
+```bash
+git clone https://github.com/bfeng1122/verieffect
+cd verieffect
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt   # Windows: .venv/Scripts/python
+.venv/bin/python tests/test_all.py
+# From a clone, `python -m verieffect.cli …` and `python verify_receipt.py …` work
+# without installing; `pip install .` adds the `verieffect` console script.
+```
+
+See [CONTRIBUTING.md](https://github.com/bfeng1122/verieffect/blob/main/CONTRIBUTING.md)
+for the full development setup.
+
+### Exit codes
+
+Exit codes — `verieffect claim …` (same as `python -m verieffect.cli claim …`), so shell scripts and
 cron jobs can branch on verification results directly:
 
 | Code | Meaning |
@@ -194,7 +218,8 @@ cron jobs can branch on verification results directly:
 | `2` | usage error, or claim aborted before any receipt was written (bad `--expect` JSON incl. duplicate keys, corrupt chain tail, lock timeout) |
 | `4` | internal error (a Verieffect bug — please report it) |
 
-Exit codes — offline verifier (`verify_receipt.py`). Verification checks
+Exit codes — offline verifier (`python -m verify_receipt`, or `python verify_receipt.py`
+from a clone). Verification checks
 authenticity offline. It never re-runs probes, because probing happened when the
 claim was filed. Two modes:
 
@@ -224,7 +249,7 @@ inside whatever repo the agent happens to run in.
   your machine.
 - `~/.verieffect/chains/chain_<agent>_<hash8>.jsonl` — append-only receipt chain per agent.
 - Override the root with `VERIEFFECT_HOME=/some/path`.
-- **Upgrading from 0.1.0a1 to 0.2.0a1** (old default: `./data` under the CWD): if
+- **Upgrading from 0.1.0a1 to 0.2.x** (old default: `./data` under the CWD): if
   `./data/keys/verieffect_ed25519.pem` exists and `~/.verieffect` doesn't (an
   unrelated `./data/keys` folder is ignored), Verieffect prints the exact move command and
   refuses to mint a second key until you either move the directory
@@ -234,7 +259,7 @@ inside whatever repo the agent happens to run in.
   that agent stop with a pointer to `verieffect repair --agent <id>`. That command
   moves the torn line to `<chain>.torn` and appends a signed `repair_note` receipt.
   The torn receipt's verdict is lost (it may have been a FAIL), so `audit` and
-  `verify_receipt.py --chain` always print a **WARNING** listing every repair note.
+  `python -m verify_receipt --chain` always print a **WARNING** listing every repair note.
   Repair notes are not verdicts: `--require-verdict` skips them (one repair does not
   block a strict gate forever), but a chain of *only* repair notes never meets it.
 
@@ -290,7 +315,7 @@ claim can run commands, because the `allow_shell` / `allow_unsafe_method` gates 
 part of the claim itself. There are three known limitations: claim-payload gates,
 no path restriction (file-read oracle) and no SSRF filtering. Each must be fixed
 before the MCP server ships; see
-[Known limitations](docs/receipt-schema.md#known-limitations--fix-gated-on-the-mcp-roadmap).
+[Known limitations](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md#known-limitations--fix-gated-on-the-mcp-roadmap).
 
 ## Offline verification
 
@@ -298,18 +323,18 @@ Anyone with the public key can verify receipts or whole chains — the standalon
 verifier needs nothing but `pip install cryptography`:
 
 ```bash
-python verify_receipt.py --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
-python verify_receipt.py --pubkey ~/.verieffect/keys/verieffect_ed25519.pub \
+python -m verify_receipt --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
+python -m verify_receipt --pubkey ~/.verieffect/keys/verieffect_ed25519.pub \
   --chain ~/.verieffect/chains/chain_my-agent_<hash8>.jsonl --agent my-agent
 
 # With an externally anchored head, also catches tail truncation/regeneration:
-python verify_receipt.py --pubkey verieffect_ed25519.pub --chain chain.jsonl \
+python -m verify_receipt --pubkey verieffect_ed25519.pub --chain chain.jsonl \
   --agent my-agent --expect-count 42 --expect-head <sha256-of-last-receipt>
 ```
 
 `verify_receipt.py` has **zero internal imports** by design — it is the reference
 implementation of the receipt format and never raises on malformed input.
-See [`docs/receipt-schema.md`](docs/receipt-schema.md) for the full spec.
+See [`docs/receipt-schema.md`](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md) for the full spec.
 
 ### Checkpointing (anti-truncation)
 
@@ -317,7 +342,7 @@ A forward-walk audit can't see tail truncation unless the chain head was anchore
 somewhere the operator can't quietly rewrite. `checkpoint` prints the anchor:
 
 ```bash
-python -m verieffect.cli checkpoint --agent my-agent --json
+verieffect checkpoint --agent my-agent --json
 # {"agent_id": "my-agent", "count": 42, "head": "0dabf352...", "as_of": "..."}
 ```
 
@@ -325,7 +350,7 @@ Wire it into anything append-only you already have: a nightly git commit of the
 output, an OpenTimestamps stamp, a message to a channel only you control. Later:
 
 ```bash
-python -m verieffect.cli audit --agent my-agent --expect-count 42 --expect-head 0dabf352...
+verieffect audit --agent my-agent --expect-count 42 --expect-head 0dabf352...
 ```
 
 **Anchor the head, not just the count.** `--expect-count` alone is not sufficient:
@@ -347,7 +372,7 @@ response).
 2. Anything not provable deterministically is `UNVERIFIABLE`, not `PASS`. That
    includes an `expect` that asserts nothing (e.g. a SQL query with neither `rows`
    nor `row_count`) and any unknown or wrongly typed `expect` key. Each probe has
-   a strict key schema; see [receipt-schema.md](docs/receipt-schema.md#expect-schemas-strict).
+   a strict key schema; see [receipt-schema.md](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md#expect-schemas-strict).
 3. `db_row_matches` is read-only (non-SELECT rejected, `query_only` enforced);
    `http_ok` is read-only by default. The verifier never mutates audited systems
    unless the claim explicitly opts in (`allow_shell` / `allow_unsafe_method` — today
@@ -363,7 +388,7 @@ wrong, and agents whose "done" report doesn't match what actually landed. The si
 machine, so an attacker with local code execution as the same user can forge
 receipts — no same-host scheme survives that. If your threat is a truly adversarial
 agent, run the verifier as a separate OS user/host (roadmap: hosted verifier).
-Full details in [receipt-schema.md](docs/receipt-schema.md).
+Full details in [receipt-schema.md](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md).
 
 ## Status
 
@@ -376,8 +401,9 @@ Roadmap: named operator-owned checks (`verieffect check <name>`), hosted verifie
 API, `kid` key rotation, `claimed_at`/`checked_at` split, connector library
 (Stripe/broker/Postgres), MCP server.
 
-See [examples/](examples/README.md) for runnable examples of all four probe kinds,
-[CONTRIBUTING.md](CONTRIBUTING.md) for adding probes, and
-[SECURITY.md](SECURITY.md) for vulnerability reporting.
+See [examples/](https://github.com/bfeng1122/verieffect/blob/main/examples/README.md) for runnable examples of all four probe kinds,
+[CONTRIBUTING.md](https://github.com/bfeng1122/verieffect/blob/main/CONTRIBUTING.md) for adding probes,
+[SECURITY.md](https://github.com/bfeng1122/verieffect/blob/main/SECURITY.md) for vulnerability reporting, and
+[CHANGELOG.md](https://github.com/bfeng1122/verieffect/blob/main/CHANGELOG.md) for release notes.
 
 MIT licensed.

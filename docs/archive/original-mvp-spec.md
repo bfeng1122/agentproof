@@ -109,5 +109,5 @@ about market demand.
   stack (no-regret downside).
 
 ## Positioning one-liner
-"Veridatum found 26% of agent tasks falsely claimed success. Verieffect makes
+"Veridatum found 26% of agent tasks falsely claimed success. [OUTDATED wording — see README: the benchmark measured final-state mismatches in simulated runs, not false claims.] Verieffect makes
 success provable — deterministic checks, signed receipts, no LLM in the loop."

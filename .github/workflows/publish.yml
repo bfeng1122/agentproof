@@ -1,15 +1,17 @@
 # Publish to PyPI using Trusted Publishing (OIDC — no long-lived token stored anywhere).
 #
-# ONE-TIME SETUP REQUIRED on pypi.org before the first run:
+# ONE-TIME SETUP on pypi.org (already done for this project):
 #   PyPI -> Account settings -> Publishing -> Add a new pending trusted publisher
 #     PyPI Project Name: verieffect
 #     Owner:             bfeng1122
 #     Repository name:   verieffect
 #     Workflow name:     publish.yml
-#     Environment:       (leave blank)
+#     Environment:       (blank — this workflow deliberately has NO `environment:`
+#                         block; the publisher config and the workflow must match)
 #
-# Trigger: push a v* tag (e.g. `git tag v0.2.0a1 && git push origin v0.2.0a1`)
-# or run manually from the Actions tab.
+# Trigger: push a v* tag (e.g. `git tag v0.2.0a2 && git push origin v0.2.0a2`)
+# or run manually from the Actions tab. The job runs the full test suite first and
+# refuses to publish if the tag (minus a leading "v") != pyproject.toml's version.
 
 name: Publish to PyPI
 
@@ -24,9 +26,6 @@ permissions:
 jobs:
   pypi-publish:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/verieffect/
     permissions:
       id-token: write   # OIDC for Trusted Publishing
     steps:
@@ -36,9 +35,32 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Tag must match package version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'EOF'
+          import os, sys, tomllib
+          tag = os.environ["TAG"]
+          tag_version = tag[1:] if tag.startswith("v") else tag
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+          if tag_version != version:
+              sys.exit(f"tag {tag!r} -> {tag_version!r} does not match "
+                       f"pyproject.toml version {version!r}; refusing to publish")
+          print(f"tag {tag!r} matches pyproject.toml version {version!r}")
+          EOF
+
+      - name: Run test suite
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python tests/test_all.py
+
       - name: Build sdist + wheel
         run: |
-          python -m pip install --upgrade pip build
+          python -m pip install build
           python -m build
 
       - name: Check metadata

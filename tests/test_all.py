@@ -4,6 +4,7 @@
 Also collectable by pytest (test_suite below); nothing runs at import time."""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1645,8 +1646,8 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
           and (uhome / ".verieffect" / "keys" / "verieffect_ed25519.pem").exists())
 
     print("== round 4: version + docs (items 3, 4, 5, 12) ==")
-    check("version 0.2.0a1 in pyproject and __init__",
-          'version = "0.2.0a1"' in pyproj and verieffect.__version__ == "0.2.0a1")
+    check("version 0.2.0a2 in pyproject and __init__",
+          'version = "0.2.0a2"' in pyproj and verieffect.__version__ == "0.2.0a2")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     check("README has no stale data/keys pubkey path",
@@ -1661,6 +1662,50 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
     check("docs say count-only anchoring is not sufficient",
           "not sufficient" in readme
           and "not sufficient" in (ROOT / "docs" / "receipt-schema.md").read_text(encoding="utf-8"))
+
+    print("== round 5: pip quick start, publish workflow, links, citations ==")
+    qs = readme.split("## Quick start", 1)[1].split("### From source", 1)[0]
+    check("pip quick start has no clone-only commands",
+          ".venv/" not in qs and "verify_receipt.py" not in qs
+          and "./README.md" not in qs and "verieffect.cli" not in qs)
+    check("pip quick start creates its own target and uses console script + module",
+          'echo "hello" > proof.txt' in qs
+          and "verieffect claim file_exists --agent my-agent --target ./proof.txt" in qs
+          and "python -m verify_receipt --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json" in qs
+          and "verieffect audit --agent my-agent" in qs
+          and "VERIEFFECT_HOME" in qs)
+    check("clone/venv steps live under 'From source'",
+          "### From source" in readme
+          and "pip install -r requirements.txt" in readme.split("### From source", 1)[1])
+    rel_links = re.findall(r"\]\((?!https?://|#|mailto:)([^)]+)\)", readme)
+    check(f"README has no relative links (PyPI renders it) {rel_links}", not rel_links)
+    check("pyproject long description is the README", 'readme = "README.md"' in pyproj)
+    pub = (ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+    # structural check: no real environment: KEY — the setup comment mentions the
+    # word `environment:` while explaining the block is deliberately absent, so a
+    # naive substring test false-fails. Strip comment lines before checking.
+    pub_code = "\n".join(l for l in pub.splitlines() if not l.lstrip().startswith("#"))
+    check("publish.yml: no environment block, keeps id-token, v* tags + dispatch",
+          "environment:" not in pub_code and "id-token: write" in pub_code
+          and 'tags: ["v*"]' in pub_code and "workflow_dispatch:" in pub_code)
+    check("publish.yml: tests run before build, tag/version gate present",
+          0 <= pub.find("tests/test_all.py") < pub.find("python -m build")
+          and pub.find("does not match") < pub.find("python -m build")
+          and 'tomllib.load(f)["project"]["version"]' in pub)
+    check("CHANGELOG: v0.2.0a2 section, v0.2.0a1 marked tagged",
+          "## v0.2.0a2" in changelog and "(tagged v0.2.0a1)" in changelog
+          and "## v0.2.0a1 — 2026-11-05 (not yet tagged)" not in changelog)
+    check("citations: OverclaimBench split, deterministic coverage, no LLM-judge claim",
+          "52.8% explicit overclaims" in readme and "27.5%" in readme
+          and "deterministically" in readme and "LLM judge" not in readme)
+    check("citations: LIMBO setup + CI qualifier",
+          "1,279" in readme and "95% CI 78–96%" in readme)
+    check("citations: Completion Illusion full title, author, link",
+          "The Completion Illusion: Why AI Agents Overclaim Done" in readme
+          and "Han Kim" in readme
+          and "https://labs.iovstudio.kr/en/papers/agent-control-tower" in readme)
+    archive = (ROOT / "docs" / "archive" / "original-mvp-spec.md").read_text(encoding="utf-8")
+    check("archived spec 26% line carries OUTDATED note", "[OUTDATED wording" in archive)
 
 
 def main():

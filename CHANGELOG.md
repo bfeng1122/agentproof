@@ -1,6 +1,33 @@
 # Changelog
 
-## v0.2.0a1 — 2026-11-05 (not yet tagged)
+## v0.2.0a2 — 2026-11-05 (not yet tagged)
+
+Docs and release-pipeline fixes from external review round 5. No changes to the
+receipt format, verdict semantics or exit codes.
+
+- **Pip quick start works verbatim from an empty folder.** The old Quick Start
+  assumed a clone: it called `.venv/bin/python` and `verify_receipt.py`, and it
+  claimed `./README.md`, none of which exist after `pip install verieffect`. The new
+  one creates `proof.txt`, then uses the `verieffect` console script and
+  `python -m verify_receipt`. It also says where keys live (`~/.verieffect`,
+  `VERIEFFECT_HOME`). The clone/venv steps moved to "From source (contributing)".
+- **Publish workflow hardening.** `publish.yml` runs the full test suite before
+  building. It fails if the pushed tag (minus a leading `v`) doesn't exactly match
+  the `pyproject.toml` version. The `environment:` block is gone, because the PyPI
+  trusted publisher is configured with a blank environment and the two must match.
+- **Citation context.** OverclaimBench's 80.4% is broken down as 52.8% explicit
+  overclaims + 27.5% omissions, with coverage measured deterministically. LIMBO's
+  90% is qualified as one setup (E1, 1,279 duplicate-producing episodes, 95% CI
+  78–96%). "The Completion Illusion" now has its full title, author (Han Kim, IOV
+  Labs), a link, and the study size (896 instances, 4 models). The same changes are
+  in the launch drafts.
+- **Absolute README links.** PyPI renders the README as the project description,
+  where relative links break. Every doc link now points to
+  `https://github.com/bfeng1122/verieffect/blob/main/…`.
+- The archived MVP spec's "26% … falsely claimed success" line has an inline
+  OUTDATED note. The historical text is kept.
+
+## v0.2.0a1 — 2026-11-05 (tagged v0.2.0a1)
 
 Breaking changes since 0.1.0a1: new default data dir, new exit codes, stricter
 `expect` validation, and refusals/caps are now UNVERIFIABLE instead of FAIL. The

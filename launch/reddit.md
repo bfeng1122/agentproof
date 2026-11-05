@@ -10,7 +10,7 @@
 
 I run a multi-agent AI trading pipeline 24/7 (paper trading — scout, analyst, risk gate, executor, bookkeeper). The whole thing hinges on one thing: when an agent says "the trade filled" or "the backup ran," is that *true*?
 
-The evidence says: not always. In Veridatum's analysis of the public τ-bench retail benchmark, 118 of 456 simulated GPT-4.1 runs (26%) failed the final-state check — the agent's transcript and the database disagreed. It's a synthetic benchmark, not a real-world error rate, but it shows why an agent's transcript isn't enough. The research literature agrees: in OverclaimBench (arXiv:2609.20812), ~80% of incomplete runs are misleadingly reported, and "The Completion Illusion" found agents self-reporting 100% completion while verified accuracy was 86–96%.
+The evidence says: not always. In Veridatum's analysis of the public τ-bench retail benchmark, 118 of 456 simulated GPT-4.1 runs (26%) failed the final-state check — the agent's transcript and the database disagreed. It's a synthetic benchmark, not a real-world error rate, but it shows why an agent's transcript isn't enough. The research literature agrees: in OverclaimBench (arXiv:2609.20812), 80.4% of incomplete runs are misleadingly reported (52.8% explicit overclaims plus 27.5% that omitted the gap), and IOV Labs' "The Completion Illusion: Why AI Agents Overclaim Done, and the Case for an Agent Control Tower" (Han Kim; https://labs.iovstudio.kr/en/papers/agent-control-tower) found agents across 896 verifiable micro-task instances and 4 models self-reporting 100% completion while verified accuracy was 86–96%.
 
 I hit this in my own setup on day one. My bookkeeper filed a claim about a backup path that didn't exist. Nothing broke because I caught it — but if I hadn't been checking, I'd have been trusting receipts for a backup that never ran.
 
@@ -30,13 +30,13 @@ https://github.com/bfeng1122/verieffect
 
 **Dangerous probes are gated:** the `exit_code` probe runs with verifier privileges, so it's off by default (`allow_shell` opt-in); `http_ok` refuses non-GET/HEAD methods unless you explicitly allow them.
 
-**Exit codes** (0/1/2) as the integration surface — cron and shell scripts branch on verification directly.
+**Exit codes** as the integration surface — cron and shell scripts branch on verification directly: 0 = PASS, 1 = FAIL, 3 = UNVERIFIABLE (2/4 = usage/internal error).
 
-**Credit where it's due — the principle isn't new.** Harper's "Re-Perceived Effects" (Sept 2026) and EffectMatch (arXiv:2609.31301) both describe checking the effect rather than trusting the self-report; they're cited in the README. And Treeship/Attestroot/Logsiegel all ship signed, chained agent receipts. The distinction I'm claiming is narrow but real: those tools *record* what the agent did and sign the record (Attestroot says outright a lying agent's capture "would seal and verify perfectly"), while Verieffect *re-queries the system of record* at verify time. Verieffect is a working implementation + the offline-receipt packaging, not a new idea.
+**Credit where it's due — the principle isn't new.** Harper's "Re-Perceived Effects" (Sept 2026) and EffectMatch (arXiv:2609.31301) both describe checking the effect rather than trusting the self-report; they're cited in the README. And Treeship/Attestroot/Logsiegel all ship signed, chained agent receipts. The distinction I'm claiming is narrow but real: those tools *record* what the agent did and sign the record (Attestroot says outright a lying agent's capture "would seal and verify perfectly"), while Verieffect's probe *re-checks the system of record itself* when the claim is filed — the verdict comes from ground truth, not from anything the agent produced. Verieffect is a working implementation + the offline-receipt packaging, not a new idea.
 
 It's been in production for two weeks: 40+ receipts across trade fills and backup checks, plus a deliberate tamper test that breaks the chain exactly as designed. Before launch I also had AI agents red-team the repo in multiple rounds — one reproduced a chain-relabeling attack, another caught the chain lock silently giving up under contention on Windows; both fixed and regression-tested. The tool's whole thesis, applied to itself.
 
-~2,700 lines of Python (+~1,700 of tests), 259 tests, CI on ubuntu+windows, MIT licensed. The receipt schema is documented and I'd genuinely like feedback on it — and on what claim kinds people actually need (S3 object exists? Docker container running? Git commit pushed?).
+~2,700 lines of Python (+~1,700 of tests), 271 tests, CI on ubuntu+windows, MIT licensed. The receipt schema is documented and I'd genuinely like feedback on it — and on what claim kinds people actually need (S3 object exists? Docker container running? Git commit pushed?).
 
 ---
 
@@ -47,3 +47,5 @@ It's been in production for two weeks: 40+ receipts across trade fills and backu
 - Check subreddit self-promotion rules; both are generally fine for OSS with substance.
 - Best time: weekday 7–10 AM Pacific.
 - Reply fast, especially to schema critique — that's the conversion path to a user.
+- Pre-post checklist: CI green on latest commit; v0.2.0a2 published to PyPI; test count in this draft matches what the suite prints.
+- Post-publish check (before posting): pip-install quick start run verbatim from an EMPTY folder against the published PyPI package (`pip install verieffect==0.2.0a2` in a fresh venv, then the README Quick start commands unchanged).
