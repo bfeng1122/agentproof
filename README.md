@@ -133,10 +133,18 @@ cron/CI. Implementation and developer experience — not the underlying idea.
 ## Quick start
 
 ```bash
+pip install verieffect        # from PyPI; gives you the `verieffect` console script
+```
+
+Or from a clone (for contributors):
+
+```bash
 python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt   # Windows: .venv/Scripts/python
 # Optional: `pip install .` also gives you a `verieffect` console script.
+```
 
+```bash
 # 1. File a claim — targets a file that ships with the repo, so this PASSES on a
 #    fresh clone (exit code 0). Keys/receipts land under ~/.verieffect (see below).
 .venv/bin/python -m verieffect.cli claim file_exists --agent my-agent \
