@@ -1646,8 +1646,8 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
           and (uhome / ".verieffect" / "keys" / "verieffect_ed25519.pem").exists())
 
     print("== round 4: version + docs (items 3, 4, 5, 12) ==")
-    check("version 0.2.0a3 in pyproject and __init__",
-          'version = "0.2.0a3"' in pyproj and verieffect.__version__ == "0.2.0a3")
+    check("version 0.2.0a4 in pyproject and __init__",
+          'version = "0.2.0a4"' in pyproj and verieffect.__version__ == "0.2.0a4")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     check("README has no stale data/keys pubkey path",
@@ -1720,9 +1720,11 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
           not (ROOT / "launch").exists())
     check("publish.yml is tag-only (no manual dispatch that would skip the version gate)",
           "workflow_dispatch" not in pub_code)
-    check("CHANGELOG v0.2.0a3 present, v0.2.0a2 marked tagged, no stale 'not yet tagged'",
-          "## v0.2.0a3" in changelog and "(tagged v0.2.0a2)" in changelog
+    check("CHANGELOG v0.2.0a4 present, v0.2.0a3 marked tagged, no stale 'not yet tagged'",
+          "## v0.2.0a4" in changelog and "(tagged v0.2.0a3)" in changelog
           and "not yet tagged" not in changelog)
+    check("README Attestroot quote attributed to 'party ... being audited', not 'lying agent'",
+          "controlled by the party" in readme and "lying agent's capture" not in readme)
 
 
 def main():

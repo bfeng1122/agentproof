@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.0a4 — 2026-11-12 (tagged v0.2.0a4)
+
+Docs-only hotfix release. No changes to the receipt format, verdict semantics,
+exit codes, or any probe behavior — shipped code is identical to 0.2.0a3 except
+the version string.
+
+- **Fixed a misattributed quote.** README (and the launch drafts) framed an
+  Attestroot quote as "a lying agent's capture 'would seal and verify perfectly.'"
+  Attestroot's actual PyPI wording: "A party controlling its own capture could
+  record something false, and it would seal and verify perfectly." The quoted
+  fragment was verbatim, but our framing attributed "lying agent" to them.
+  Corrected to "a capture controlled by the party being audited" after verifying
+  the live PyPI description. Caught by an external reviewer before the HN launch —
+  a misattributed quote in a post about verifying claims would have been the one
+  unforgivable own-goal.
+- This release exists only to refresh the PyPI long description (the README), so
+  the published package page and the repo can't disagree.
+
 ## v0.2.0a3 — 2026-11-05 (tagged v0.2.0a3)
 
 Docs-only release from external review round 6. No changes to the receipt format,
