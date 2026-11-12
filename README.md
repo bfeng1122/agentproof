@@ -123,8 +123,9 @@ described the idea or solved adjacent problems:
   **[Logsiegel](https://logsiegel.com)**, **[Tanilo](https://tanilo.io)** — signed,
   hash-chained/Merkle agent receipts with offline verification. Overlapping on the
   *receipt* layer. The distinction: they **record what the agent did** (wrap commands,
-  seal transcripts); Attestroot states plainly that a lying agent's capture "would
-  seal and verify perfectly." Verieffect **queries the system of record itself** when
+  seal transcripts); Attestroot states plainly that a capture controlled by the party
+  being audited "would seal and verify perfectly." Verieffect **queries the system of
+  record itself** when
   the claim is filed. The probe runs inside Verieffect, not inside the agent. (Offline
   verification later checks the receipt's authenticity; it does not re-probe.)
 - **[Veridatum](https://veridatum.io/)** — the same principle (check the claim against
