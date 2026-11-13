@@ -1,5 +1,10 @@
 # Verieffect
 
+[![PyPI version](https://img.shields.io/pypi/v/verieffect)](https://pypi.org/project/verieffect/)
+[![Python versions](https://img.shields.io/pypi/pyversions/verieffect)](https://pypi.org/project/verieffect/)
+[![License](https://img.shields.io/pypi/l/verieffect)](https://github.com/bfeng1122/verieffect/blob/main/LICENSE)
+[![CI](https://github.com/bfeng1122/verieffect/actions/workflows/tests.yml/badge.svg)](https://github.com/bfeng1122/verieffect/actions/workflows/tests.yml)
+
 **Verify the effect. Not the claim.**
 
 *Independent, deterministic verification for AI agents — with signed, offline-verifiable
@@ -14,29 +19,26 @@ $ verieffect claim file_exists --agent backup-cron \
     --target ./backups/nightly.dump --expect '{"min_bytes": 1048576}' --out receipt.json
 {
   "v": 1,
-  "claim_id": "830c4620-deb4-4d5e-a4d2-ed83c77f79da",
+  "claim_id": "08798282-a3f5-4336-88a7-4077db23c923",
   "agent_id": "backup-cron",
   "kind": "file_exists",
   "target": "./backups/nightly.dump",
   "expect": { "min_bytes": 1048576 },
-  "observed": { "path": "backups\\nightly.dump", "exists": true, "size": 2, "mtime": 1793862129 },
+  "observed": { "path": "backups/nightly.dump", "exists": true, "is_dir": false,
+                "is_regular_file": true, "size": 2, "mtime": 1794520971 },
   "verdict": "FAIL",
-  ...
-  "sig": "ed25519:8bfac27e…"
+  "checked_at": "2026-11-12T22:02:51Z",
+  "prev_receipt_hash": "0000...0000",
+  "sig": "ed25519:dd90863d…"
 }
 $ echo $?
 1
 $ python -m verify_receipt --pubkey ~/.verieffect/keys/verieffect_ed25519.pub receipt.json
-VALID: ok (claim 830c4620-deb4-4d5e-a4d2-ed83c77f79da, verdict FAIL)
+VALID: ok (claim 08798282-a3f5-4336-88a7-4077db23c923, verdict FAIL)
 ```
-(output from a Windows run — observed.path uses backslashes)
 
 The file exists — it's just 2 bytes. "Backup ran" was true; "backup landed" wasn't.
 The signed `FAIL` receipt is the evidence, and exit code `1` lets cron alert on it.
-
-> **Renamed from AgentProof** (2026-10-30) after finding 5+ existing products on that
-> name. Same project and repo history; the signing key is unchanged, so pre-rename
-> receipts still verify.
 
 > **What the signature does and doesn't prove.** The signing key lives next to your
 > agents (same host, MVP). Receipts are therefore **tamper-evident against drift and
@@ -111,7 +113,7 @@ described the idea or solved adjacent problems:
   file, check the process return code — with a total checker that yields
   "Unverifiable" on malformed input rather than raising. Same core principle and
   several of the same rules as our `file_exists`/`exit_code` probes. It's a short
-  conceptual note; Verieffect is a shipped, tested implementation (200+ test checks, CI,
+  conceptual note; Verieffect is a shipped, tested implementation (285 test checks, CI,
   dogfooded) and adds the packaging that note names as its own gap: sealed
   receipts re-verifiable offline.
 - **[Beyond Approved Actions: Runtime Validation of Persistent Outcomes in Agent Workflows](https://arxiv.org/abs/2609.31301)**
@@ -268,6 +270,28 @@ inside whatever repo the agent happens to run in.
   Repair notes are not verdicts: `--require-verdict` skips them (one repair does not
   block a strict gate forever), but a chain of *only* repair notes never meets it.
 
+## Using it from Python
+
+Today the only integration surface is the CLI. From Python, call it as a
+subprocess and branch on the exit code:
+
+```python
+import subprocess, json
+r = subprocess.run(
+    ["verieffect", "claim", "file_exists", "--agent", "my-agent",
+     "--target", "./report.pdf", "--expect", '{"min_bytes": 1024}',
+     "--out", "receipt.json"],
+    capture_output=True, text=True)
+if r.returncode == 0:      # 0=PASS 1=FAIL 3=UNVERIFIABLE 2/4=usage/internal error
+    print("verified")
+receipt = json.load(open("receipt.json"))
+```
+
+The exit codes (see [Exit codes](#exit-codes)) are the contract. A first-class
+Python API — importable claim/verify functions with typed results — is on the
+roadmap; until then, importing from the `verieffect` package is not a documented
+or stable surface.
+
 ## How it compares
 
 | | Verieffect | Treeship | Attestroot | Logsiegel | Veridatum |
@@ -395,20 +419,36 @@ receipts — no same-host scheme survives that. If your threat is a truly advers
 agent, run the verifier as a separate OS user/host (roadmap: hosted verifier).
 Full details in [receipt-schema.md](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md).
 
+## Known limitations
+
+- **Stale or mismatched receipts.** The offline verifier validates signature,
+  schema, and chain, but cannot require that a receipt matches a specific target,
+  kind, or maximum age — a CI gate that accepts any VALID receipt would accept an
+  old PASS for a different check. Until `--expect-target` / `--max-age` style flags
+  exist, pin receipts by `claim_id` or re-check `checked_at` yourself.
+- **Claimer-chosen checks, claim-payload gates, no path restriction, no SSRF
+  filtering** — see the trust boundary note above and the full list in
+  [receipt-schema.md](https://github.com/bfeng1122/verieffect/blob/main/docs/receipt-schema.md#threat-model-what-receipts-do-and-dont-prove).
+
 ## Status
 
-MVP (Alpha). 200+ test checks (`python tests/test_all.py` with the venv python, or
+MVP (Alpha). 285 test checks (`python tests/test_all.py` with the venv python, or
 `pytest tests/`; CI runs ubuntu+windows × Python 3.10–3.12). Dogfooded on a 24/7
-paper-trading stack since mid-Oct 2026 (45+ receipts): fills, portfolio state and
+paper-trading stack since mid-Oct 2026 (55+ receipts): fills, portfolio state and
 backups, plus a deliberate tamper test that breaks the chain as designed.
 Not yet battle-tested by anyone else.
 Roadmap: named operator-owned checks (`verieffect check <name>`), hosted verifier
-API, `kid` key rotation, `claimed_at`/`checked_at` split, connector library
+API, `kid` key rotation, `claimed_at`/`checked_at` split, `--expect-target` / `--max-age`
+flags for the verifier, a first-class Python API, connector library
 (Stripe/broker/Postgres), MCP server.
 
 See [examples/](https://github.com/bfeng1122/verieffect/blob/main/examples/README.md) for runnable examples of all four probe kinds,
 [CONTRIBUTING.md](https://github.com/bfeng1122/verieffect/blob/main/CONTRIBUTING.md) for adding probes,
 [SECURITY.md](https://github.com/bfeng1122/verieffect/blob/main/SECURITY.md) for vulnerability reporting, and
 [CHANGELOG.md](https://github.com/bfeng1122/verieffect/blob/main/CHANGELOG.md) for release notes.
+
+> **Renamed from AgentProof** (2026-10-30) after finding 5+ existing products on that
+> name. Same project and repo history; the signing key is unchanged, so pre-rename
+> receipts still verify.
 
 MIT licensed.

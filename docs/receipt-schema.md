@@ -290,6 +290,12 @@ chain is audited with `--agent`) belongs to the claimed agent.
 7. **Network position.** `http_ok` fetches from the verifier's network — treat it
    as an SSRF/content-oracle surface; only wire claims from trusted claimers.
    (Details under Known limitations, H3.)
+8. **Stale or mismatched receipts.** The offline verifier validates signature,
+   schema, and chain, but cannot require that a receipt matches a specific target,
+   kind, or maximum age — a CI gate that accepts any VALID receipt would accept an
+   old PASS for a different check. Until `--expect-target` / `--max-age` style
+   flags exist (roadmap), pin receipts by `claim_id` or re-check `checked_at`
+   yourself.
 
 ### Known limitations — fix gated on the MCP roadmap
 

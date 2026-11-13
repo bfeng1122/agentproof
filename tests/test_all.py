@@ -1726,6 +1726,43 @@ def _run_round4(tmp, *, f, env, _cli, run_vr, write_lines, cli_priv, cli_pub_pat
     check("README Attestroot quote attributed to 'party ... being audited', not 'lying agent'",
           "controlled by the party" in readme and "lying agent's capture" not in readme)
 
+    print("== pre-launch polish: README counts, examples, Python section, limits, badges ==")
+    examples = (ROOT / "examples" / "README.md").read_text(encoding="utf-8")
+    check("examples/README.md has no AgentProof-era home and no clone-only venv python",
+          "ap-examples" not in examples and ".venv/Scripts/python" not in examples
+          and "/tmp/verieffect-examples" in examples)
+    check("README has a 'Using it from Python' section (CLI is the only surface today)",
+          "## Using it from Python" in readme
+          and "only integration surface is the CLI" in readme)
+    lim = readme.split("## Known limitations", 1)[1].split("\n## ", 1)[0] \
+        if "## Known limitations" in readme else ""
+    roadmap = readme.split("Roadmap:", 1)[1].split("\n\n", 1)[0] if "Roadmap:" in readme else ""
+    check("README documents the stale-receipt limitation (limitations + roadmap)",
+          ("max-age" in lim or "maximum age" in lim) and "--max-age" in roadmap
+          and "--expect-target" in roadmap)
+    check("README badge row present (PyPI version/pyversions/license + CI)",
+          all(u in readme for u in (
+              "https://img.shields.io/pypi/v/verieffect",
+              "https://img.shields.io/pypi/pyversions/verieffect",
+              "https://img.shields.io/pypi/l/verieffect",
+              "https://github.com/bfeng1122/verieffect/actions/workflows/tests.yml/badge.svg")))
+    check("probe_request issue template exists",
+          (ROOT / ".github" / "ISSUE_TEMPLATE" / "probe_request.md").is_file())
+    first60 = "\n".join(readme.splitlines()[:60])
+    check("'Renamed from AgentProof' blockquote kept but moved below the fold (not in first 60 lines)",
+          "Renamed from AgentProof" in readme and "Renamed from AgentProof" not in first60)
+    check("README dogfood count is '55+ receipts' (no stale 45+)",
+          "55+ receipts" in readme and "45+ receipts" not in readme)
+    # Keep this check LAST: the README's "N test checks" must equal the CI (Linux)
+    # total. len(results) + 1 counts this check itself; Windows skips exactly one
+    # POSIX-only check (key mode 0600), so add it back there.
+    total_ci = len(results) + 1 + (0 if os.name == "posix" else 1)
+    counts = re.findall(r"(\d+)\+? test checks", readme)
+    check(f"README test-check count matches the CI suite total ({total_ci}; README says {counts})",
+          counts and all(c == str(total_ci) for c in counts)
+          and "200+ test checks" not in readme
+          and f"{total_ci} test checks" in readme)
+
 
 def main():
     results.clear()
